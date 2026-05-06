@@ -36,6 +36,7 @@ class TestPluginContract(unittest.TestCase):
 
         self.assertEqual(version, _skill_version())
         self.assertEqual(version, _json(ROOT / ".claude-plugin" / "plugin.json")["version"])
+        self.assertEqual(version, _json(ROOT / "gemini-extension.json")["version"])
 
         marketplace = _json(ROOT / ".claude-plugin" / "marketplace.json")
         plugins = marketplace.get("plugins") or []
