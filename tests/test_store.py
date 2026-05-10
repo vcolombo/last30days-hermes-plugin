@@ -535,6 +535,32 @@ def test_store_findings_sightings_are_idempotent_per_run(temp_db):
     assert len(sightings) == 1
 
 
+def test_store_findings_updates_existing_sighting_for_same_run(temp_db):
+    """Test that retrying a run refreshes its sighting snapshot instead of freezing it."""
+    topic = store.add_topic("Test Topic")
+    run_id = store.record_run(topic["id"], source_mode="v3")
+    finding = {
+        "source": "reddit",
+        "source_url": "https://reddit.com/1",
+        "source_title": "Reddit 1",
+        "content": "Content",
+        "engagement_score": 10.0,
+        "relevance_score": 0.7,
+    }
+
+    store.store_findings(run_id, topic["id"], [finding])
+    store.store_findings(
+        run_id,
+        topic["id"],
+        [{**finding, "source_title": "Reddit 1 updated", "engagement_score": 15.0}],
+    )
+
+    sightings = store.get_sightings_for_run(topic["id"], run_id)
+    assert len(sightings) == 1
+    assert sightings[0]["source_title"] == "Reddit 1 updated"
+    assert sightings[0]["engagement_score"] == 15.0
+
+
 def test_update_validates_allowed_columns(temp_db, sample_report):
     """Test update_run/update_finding accept valid keys and reject invalid keys."""
     topic = store.add_topic("Test Topic")

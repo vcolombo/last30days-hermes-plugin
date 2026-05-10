@@ -446,7 +446,7 @@ def store_findings(
 
         new_count = len(insert_rows)
         updated_count = len(update_rows)
-        _record_sightings(conn, run_id, topic_id, with_urls)
+        _record_sightings(conn, run_id, topic_id, with_urls, existing_by_url)
         conn.execute(
             "UPDATE research_runs SET findings_new = ?, findings_updated = ? WHERE id = ?",
             (new_count, updated_count, run_id),
@@ -463,6 +463,7 @@ def _record_sightings(
     run_id: int,
     topic_id: int,
     findings_with_urls: List[tuple[str, Dict[str, Any]]],
+    existing_by_url: Optional[Dict[str, sqlite3.Row]] = None,
 ) -> None:
     """Record the findings observed during this run.
 
@@ -474,20 +475,28 @@ def _record_sightings(
         return
 
     by_url = {url: finding for url, finding in findings_with_urls}
-    placeholders = ",".join("?" for _ in by_url)
-    rows = conn.execute(
-        f"SELECT id, source_url FROM findings WHERE source_url IN ({placeholders})",
-        list(by_url),
-    ).fetchall()
+    rows_by_url = dict(existing_by_url or {})
+
+    missing_urls = [url for url in by_url if url not in rows_by_url]
+    if missing_urls:
+        placeholders = ",".join("?" for _ in missing_urls)
+        rows = conn.execute(
+            f"SELECT id, source_url FROM findings WHERE source_url IN ({placeholders})",
+            missing_urls,
+        ).fetchall()
+        rows_by_url.update({row["source_url"]: row for row in rows})
+
     sighting_rows = []
-    for row in rows:
-        finding = by_url[row["source_url"]]
+    for url, finding in by_url.items():
+        row = rows_by_url.get(url)
+        if row is None:
+            continue
         sighting_rows.append((
             row["id"],
             run_id,
             topic_id,
             finding.get("source", "unknown"),
-            row["source_url"],
+            url,
             finding.get("source_title") or finding.get("title", ""),
             finding.get("engagement_score", 0),
             finding.get("relevance_score", 0),
@@ -497,10 +506,17 @@ def _record_sightings(
         return
 
     conn.executemany(
-        """INSERT OR IGNORE INTO finding_sightings
+        """INSERT INTO finding_sightings
            (finding_id, run_id, topic_id, source, source_url, source_title,
             engagement_score, relevance_score)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(run_id, finding_id) DO UPDATE SET
+             topic_id = excluded.topic_id,
+             source = excluded.source,
+             source_url = excluded.source_url,
+             source_title = excluded.source_title,
+             engagement_score = excluded.engagement_score,
+             relevance_score = excluded.relevance_score""",
         sighting_rows,
     )
 
