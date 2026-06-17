@@ -272,34 +272,49 @@ def get_text(
 
 
 class RateLimiter:
-    """Thread-safe minimum-interval throttle for an endpoint family.
+    """Thread-safe token-bucket throttle for an endpoint family.
 
     The keyless source tiers run under the pipeline's ThreadPoolExecutor, so a
     multi-subquery run can fire many requests at the same host at once. A bare
     per-request retry budget does not prevent that stampede — it only reacts
-    after a 429. This spaces calls so concurrent futures sharing one limiter
-    cannot burst past ``min_interval`` seconds between requests.
+    after a 429. A token bucket bounds the *sustained* rate while still allowing
+    a short burst, so legitimate parallelism is preserved (unlike a strict
+    min-interval gate that would serialize every concurrent caller and could
+    push later futures past their result timeouts).
+
+    ``rate_per_sec`` tokens refill per second; ``burst`` is the bucket capacity
+    (max simultaneous calls before throttling kicks in). The lock is released
+    while sleeping so waiting threads don't serialize on each other.
     """
 
-    def __init__(self, min_interval: float):
-        self.min_interval = min_interval
-        self._last = 0.0
+    def __init__(self, rate_per_sec: float, burst: int | None = None):
+        self.rate = rate_per_sec
+        self.capacity = burst if burst is not None else max(1, int(rate_per_sec))
+        self._tokens = float(self.capacity)
+        self._last = time.monotonic()
         self._lock = threading.Lock()
 
     def acquire(self) -> None:
-        """Block until at least ``min_interval`` has elapsed since the last call."""
-        with self._lock:
-            now = time.monotonic()
-            wait = self.min_interval - (now - self._last)
-            if wait > 0:
-                time.sleep(wait)
+        """Consume one token, blocking only when the bucket is empty."""
+        while True:
+            with self._lock:
                 now = time.monotonic()
-            self._last = now
+                # Clamp elapsed to >= 0: a backward clock reading must never
+                # drive tokens negative (which would spin this loop forever).
+                elapsed = max(0.0, now - self._last)
+                self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self.rate
+            time.sleep(wait)
 
 
 # Shared across all keyless Reddit tiers (RSS, listing, shreddit) so their
-# combined fan-out is throttled as one family, not three independent bursts.
-REDDIT_KEYLESS_LIMITER = RateLimiter(min_interval=0.5)
+# combined fan-out is throttled as one family. Burst lets the parallel
+# enrichment workers proceed; sustained rate caps the stampede.
+REDDIT_KEYLESS_LIMITER = RateLimiter(rate_per_sec=5.0, burst=5)
 
 
 def reddit_keyless_get_text(

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import html
 import re
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import http
 
@@ -48,8 +48,10 @@ _SNIPPET_RE = re.compile(
 
 
 def _domain(url: str) -> str:
+    # Normalize identically to grounding._domain (strip + lowercase) so keyless
+    # and paid results dedupe/group consistently by source_domain.
     try:
-        return urlparse(url).netloc
+        return urlparse(url).netloc.strip().lower()
     except (ValueError, AttributeError):
         return ""
 
@@ -96,30 +98,33 @@ def keyless_search(
 
 
 def _search_ddg(query: str, count: int) -> list[dict]:
-    from urllib.parse import urlencode
-
     url = f"{_DDG_HTML_URL}?{urlencode({'q': query})}"
     text = http.get_text(url, accept="text/html", retries=2)
     if not text:
         return []
     items: list[dict] = []
-    snippets = _SNIPPET_RE.findall(text)
-    for i, match in enumerate(_RESULT_A_RE.finditer(text)):
+    # Associate each result's snippet by position, not by a parallel index:
+    # some result anchors (video/news modules) have no snippet, so a global
+    # zip would shift every later snippet onto the wrong result. Take the first
+    # snippet that falls between this anchor and the next one.
+    matches = list(_RESULT_A_RE.finditer(text))
+    for idx, match in enumerate(matches):
         if len(items) >= count:
             break
         target = _unwrap_ddg_redirect(match.group("href"))
         if not target.startswith("http"):
             continue
+        next_start = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        window = text[match.end():next_start]
+        snippet_match = _SNIPPET_RE.search(window)
+        snippet = _strip_html(snippet_match.group("snippet")) if snippet_match else ""
         title = _strip_html(match.group("title"))
-        snippet = _strip_html(snippets[i]) if i < len(snippets) else ""
-        items.append(_to_item(i, title, target, snippet))
+        items.append(_to_item(len(items), title, target, snippet))
     return items
 
 
 def _search_searxng(query: str, count: int, instance_url: str) -> list[dict]:
     base = instance_url.rstrip("/")
-    from urllib.parse import urlencode
-
     url = f"{base}/search?{urlencode({'q': query, 'format': 'json'})}"
     try:
         data = http.get(url, headers={"Accept": "application/json"}, timeout=15, retries=2)

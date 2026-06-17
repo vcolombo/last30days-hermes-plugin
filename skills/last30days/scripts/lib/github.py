@@ -202,11 +202,12 @@ def search_github(
         envelope = {"items": [], "context": {"core": core, "from_date": from_date,
                                              "to_date": to_date, "count": count}}
         if not authed:
-            # Most likely the anon rate limit (403). Surface it so the pipeline
-            # records a degraded/failed reason instead of silently showing zero.
+            # Could be the anon rate limit (403) or an unprocessable query (422)
+            # -- _fetch_json maps both to None. Don't over-claim which; suggest a
+            # token since that fixes the common (rate-limit) case.
             envelope["error"] = (
-                "GitHub unauthenticated request failed (likely anon rate limit; "
-                "set GITHUB_TOKEN or run gh auth login for higher limits)"
+                "GitHub unauthenticated request returned no data (anon rate limit "
+                "or unprocessable query; set GITHUB_TOKEN or run gh auth login)"
             )
         return envelope
 

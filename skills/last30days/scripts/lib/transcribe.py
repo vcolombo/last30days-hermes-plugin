@@ -20,12 +20,11 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import env, health
+from . import env, health, subproc
 
 # Whisper's documented upload ceiling. We compress to stay under it and chunk
 # when a single clip still exceeds it.
@@ -224,9 +223,13 @@ def _post_audio(provider: str, path: str, api_key: str, timeout: float) -> Optio
 
 
 def _run(command: list[str], timeout: float = 120.0) -> bool:
-    """Run a subprocess; return True on exit 0, False on any failure. No raise."""
+    """Run a subprocess; return True on exit 0, False on any failure. No raise.
+
+    Uses subproc.run_with_timeout so a timed-out yt-dlp/ffmpeg is killed at the
+    process-group level (os.setsid/killpg) instead of orphaning child trees.
+    """
     try:
-        proc = subprocess.run(command, capture_output=True, timeout=timeout)
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        result = subproc.run_with_timeout(command, timeout=int(timeout))
+    except (subproc.SubprocTimeout, FileNotFoundError, OSError):
         return False
-    return proc.returncode == 0
+    return result.returncode == 0

@@ -119,18 +119,24 @@ def _open_secret_append(path: Path):
 def _format_env_value(value: str) -> str:
     """Quote a value so it round-trips through env.load_env_file.
 
-    The loader strips a single layer of matching surrounding quotes, so values
-    containing whitespace or a leading quote are wrapped in double quotes to
-    survive the parse. Plain tokens (the common case) are returned unchanged.
-    Embedded double quotes are backslash-escaped. Newlines are not permitted in
-    a single-line env value and are stripped defensively.
+    env.load_env_file strips a single layer of matching surrounding quotes but
+    does NOT process backslash escapes, so we wrap (never escape):
+      - plain tokens (no whitespace, no leading quote): returned unchanged;
+      - values with whitespace/leading quote and no double-quote: double-quoted;
+      - values containing a double-quote but no single-quote: single-quoted;
+      - values containing both quote types: returned as-is (best effort; no
+        wrapper round-trips through the loader, and tokens never hit this).
+    Newlines are not valid in a single-line env value and are stripped.
     """
     value = value.replace("\r", "").replace("\n", " ")
     needs_quoting = (not value) or value[0] in ("'", '"') or any(c.isspace() for c in value)
     if not needs_quoting:
         return value
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    if '"' not in value:
+        return f'"{value}"'
+    if "'" not in value:
+        return f"'{value}'"
+    return value
 
 
 def write_setup_config(env_path: Path, from_browser: str = "auto") -> bool:

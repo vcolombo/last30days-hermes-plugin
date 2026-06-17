@@ -6,28 +6,32 @@ from lib import http, reddit_rss
 
 
 class TestRateLimiter:
-    def test_first_acquire_does_not_sleep(self):
-        limiter = http.RateLimiter(min_interval=0.5)
+    def test_burst_does_not_sleep(self):
+        # A full bucket lets `burst` calls through immediately.
+        limiter = http.RateLimiter(rate_per_sec=5.0, burst=3)
         with mock.patch.object(http.time, "monotonic", return_value=100.0), \
              mock.patch.object(http.time, "sleep") as slept:
             limiter.acquire()
+            limiter.acquire()
+            limiter.acquire()
         slept.assert_not_called()
 
-    def test_second_acquire_sleeps_to_maintain_interval(self):
-        limiter = http.RateLimiter(min_interval=0.5)
-        # First call at t=100, second call 0.1s later -> must wait ~0.4s.
-        times = iter([100.0, 100.1, 100.5])
+    def test_sleeps_when_bucket_empty(self):
+        # burst=1: first call passes, second (same instant) must wait ~1/rate.
+        limiter = http.RateLimiter(rate_per_sec=2.0, burst=1)
+        times = iter([100.0, 100.0, 100.0, 100.5])
         with mock.patch.object(http.time, "monotonic", side_effect=lambda: next(times)), \
              mock.patch.object(http.time, "sleep") as slept:
-            limiter.acquire()
-            limiter.acquire()
-        slept.assert_called_once()
+            limiter.acquire()  # consumes the one token
+            limiter.acquire()  # bucket empty -> sleep, then refilled token consumed
+        slept.assert_called()
         waited = slept.call_args.args[0]
-        assert abs(waited - 0.4) < 1e-6
+        assert abs(waited - 0.5) < 1e-6  # (1 token deficit) / 2 per sec
 
-    def test_no_sleep_when_interval_already_elapsed(self):
-        limiter = http.RateLimiter(min_interval=0.5)
-        times = iter([100.0, 102.0])  # 2s gap > interval
+    def test_refill_over_time_avoids_sleep(self):
+        limiter = http.RateLimiter(rate_per_sec=2.0, burst=1)
+        # Second call 1s later: bucket refilled (2/s * 1s capped at burst=1) -> no sleep.
+        times = iter([100.0, 101.0])
         with mock.patch.object(http.time, "monotonic", side_effect=lambda: next(times)), \
              mock.patch.object(http.time, "sleep") as slept:
             limiter.acquire()

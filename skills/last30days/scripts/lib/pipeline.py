@@ -1166,10 +1166,10 @@ def _retrieve_stream(
         token = github.resolve_token(config.get("GITHUB_TOKEN"))
         response = github.search_github(subquery.search_query, from_date, to_date, depth=depth, token=token)
         items = github.parse_github_response(response)
-        if not items and response.get("error"):
-            # Surface unauth rate-limit (or other hard failure) so the run
-            # records it as degraded/failed instead of silently showing zero.
-            raise RuntimeError(response["error"])
+        # Note: an unauth rate-limit (response["error"]) is expected on the
+        # tokenless anon tier and returns empty here rather than raising — github
+        # is now always eligible, so raising would spam "github failed" on every
+        # tokenless run. The condition is logged in github.search_github.
         items = github.enrich_with_comments(items, depth=depth, token=token)
         return items, {}
     if source == "pinterest":
