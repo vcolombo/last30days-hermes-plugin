@@ -59,3 +59,25 @@ jobs:
           path: ./
           version: v3.95.2
           extra_args: --only-verified
+
+  sast-scan:
+    name: SAST scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep:1.167.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # Advisory-first: visibility before enforcement. Semgrep CE scans
+      # the repository with the community rule set (Python, shell, YAML,
+      # JavaScript, Go) to catch source-level security bugs before they
+      # reach production. Set continue-on-error: false once a clean baseline
+      # is confirmed.
+      - name: Run Semgrep SAST scan
+        continue-on-error: true
+        run: semgrep scan --config=auto
