@@ -47,8 +47,10 @@ def test_html_handoff_opens_locally_without_os_command_menu():
 
 def test_html_save_flow_does_not_publish_or_upload():
     text = SAVE_HTML.read_text(encoding="utf-8")
-    assert "Do not offer public publishing or upload in this flow" in text
+    assert "Do not upload in this flow" in text
+    assert "Hosted sharing is a separate opt-in capability" in text
     assert "Do NOT publish, upload, or send the HTML to a third-party service" in text
+    assert "Do NOT block a local HTML export on a hosting decision" in text
 
 
 def test_follow_up_turn_preserves_html_deliverable_mode():

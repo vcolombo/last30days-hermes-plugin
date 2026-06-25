@@ -41,6 +41,9 @@ def test_html_publish_reference_prompts_for_password_choice():
     publish_section = text[text.index("## Optional hosted publishing"):text.index("## What ends up in the HTML file")]
     assert "Respect any existing user, project, or host preference for HTML publishing first" in publish_section
     assert "Offer `ht-ml.app` only as the fallback hosted option" in publish_section
+    assert "Local HTML save remains the default and should not be delayed" in publish_section
+    assert "Want a hosted link too?" in publish_section
+    assert "Do not upload until the user answers" in publish_section
     assert "ask whether they want password protection before uploading" in publish_section
     assert "**Public link** - proceed with `--publish-html` only" in publish_section
     assert "**Password-protected link** - ask them to provide the shared password" in publish_section

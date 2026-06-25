@@ -83,9 +83,15 @@ fi
 
 ## Optional hosted publishing
 
-Only publish when the user explicitly asks for a hosted/shareable web link or confirms they want one after you offer it. Local HTML save remains the default.
+Only publish when the user explicitly asks for a hosted/shareable web link or confirms they want one after an opt-in offer. Local HTML save remains the default and should not be delayed by an optional hosting choice unless the user's original request specifically asked for a hosted URL.
 
 Respect any existing user, project, or host preference for HTML publishing first. If the user already has a preferred publisher or internal sharing workflow, use that. Offer `ht-ml.app` only as the fallback hosted option when no preference is already established.
+
+Use this decision flow:
+
+- If the user asked only for a local HTML file/export, save the local HTML and stop at the artifact handoff. Do not offer hosted publishing.
+- If the user asked for sharing convenience but did not specifically ask for a hosted URL, save the local HTML first. After the artifact handoff, offer one opt-in hosted-link question only when no existing publishing preference is available: `Want a hosted link too? I can use ht-ml.app as a fallback; it is public and may be indexed unless password-protected. Reply public or password: <shared password>.`
+- If the user explicitly asked for a hosted URL/publish/share link, save the local HTML first, then ask the password/public question before uploading unless they already specified public hosting or supplied a shared password.
 
 Before publishing, tell the user:
 
@@ -133,6 +139,8 @@ I saved the full HTML brief locally. It is not uploaded or published anywhere.
 
 If the host can safely open local files for the user and doing so matches the user's request, open the HTML file after it is written, leave the saved-path line in chat, and add `Opened locally.` Let the host choose the correct OS-specific mechanism; do not print a menu of shell commands. If opening fails or the host is headless, do not treat that as a failed report; show the path and say the file is ready to open in a browser.
 
+If the request was about sharing convenience rather than a purely local export, and no existing publishing preference applies, add the opt-in hosted-link question from the optional publishing section after the local handoff. Do not upload until the user answers.
+
 ### Normal report plus HTML copy
 
 When the user asked for a normal `/last30days` report and also asked for an HTML copy, keep the full chat synthesis and append this artifact block after the invitation:
@@ -141,7 +149,7 @@ When the user asked for a normal `/last30days` report and also asked for an HTML
 📎 Shareable brief saved to <absolute HTML path>
 ```
 
-If the host can safely open local files, open it for the user when that matches the request; otherwise the saved-path line is enough. Do not offer public publishing or upload in this flow. Hosted sharing is a separate opt-in capability and must not happen automatically.
+If the host can safely open local files, open it for the user when that matches the request; otherwise the saved-path line is enough. Do not upload in this flow. Hosted sharing is a separate opt-in capability and must not happen automatically; if the user framed the HTML copy as a sharing convenience and no existing publishing preference applies, add the same single hosted-link opt-in question after the artifact block.
 
 ## What ends up in the HTML file
 
@@ -177,6 +185,7 @@ The engine will try to reuse `~/.config/last30days/last-report.json` for that se
 - Do NOT include the data quality warning text in the temp file or in your final chat line. Warnings are an engine-stderr concern, not an artifact concern.
 - Do NOT publish, upload, or send the HTML to a third-party service as part of the local save flow.
 - Do NOT publish to `ht-ml.app` merely because HTML was requested. Hosted publishing is a separate opt-in step.
+- Do NOT block a local HTML export on a hosting decision unless the user explicitly asked for a hosted URL.
 - Do NOT paste or store the `update_key` in chat, Markdown, HTML, raw output, or companion metadata.
 
 ## Edge cases
