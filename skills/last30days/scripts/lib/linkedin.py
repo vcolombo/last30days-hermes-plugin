@@ -19,14 +19,14 @@ from . import http, log
 SC_BASE = "https://api.scrapecreators.com/v1/linkedin"
 
 DEPTH_CONFIG: dict[str, dict[str, Any]] = {
-    "quick": {"date_posted": "last-week", "max_results": 5},
-    "default": {"date_posted": "last-week", "max_results": 8},
-    "deep": {"date_posted": "last-week", "max_results": 10},
+    "quick": {"date_posted": "last-week", "max_results": 10},
+    "default": {"date_posted": "last-month", "max_results": 20},
+    "deep": {"date_posted": "last-month", "max_results": 30},
 }
 
 
 def _log(msg: str) -> None:
-    log.source_log("LinkedIn", msg)
+    log.source_log("LinkedIn", msg, tty_only=False)
 
 
 def search_linkedin(
