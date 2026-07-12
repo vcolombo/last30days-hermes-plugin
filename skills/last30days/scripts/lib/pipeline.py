@@ -742,13 +742,30 @@ def run(
         model=None if mock else runtime.rerank_model,
     )
 
-    # Phase 3: post-rerank GitHub star enrichment
+    # Phase 3: post-rerank GitHub star enrichment. Record/replay-aware so the
+    # eval harness stays fully offline: this path calls the GitHub API (and the
+    # gh-credential fallback) outside the _retrieve_stream seam, so it gets its
+    # own fixture exchange keyed by phase.
     if "github" in available and not mock:
-        github.enrich_candidates_with_stars(
-            ranked_candidates,
-            token=config.get("GITHUB_TOKEN"),
-            already_enriched=_github_enriched_repos,
-        )
+        star_request = {
+            "source": "github",
+            "phase": "post_rerank_star_enrichment",
+            "topic": topic,
+            "depth": depth,
+        }
+        star_matched, star_replayed = http.fixture_source_replay(star_request)
+        if star_matched:
+            star_map = star_replayed if isinstance(star_replayed, dict) else {}
+            github.apply_star_map(ranked_candidates, star_map)
+        else:
+            collected_star_map: dict[str, int] = {}
+            github.enrich_candidates_with_stars(
+                ranked_candidates,
+                token=config.get("GITHUB_TOKEN"),
+                already_enriched=_github_enriched_repos,
+                collect_map=collected_star_map,
+            )
+            http.fixture_source_record(star_request, collected_star_map)
 
     clusters = cluster_candidates(ranked_candidates, plan)
     warnings = _warnings(items_by_source, ranked_candidates, bundle.errors_by_source, degraded_by_source)
@@ -814,6 +831,12 @@ def _finalize_items_by_source(
     for source, items in items_by_source_raw.items():
         items = sorted(items, key=lambda item: item.local_rank_score or 0.0, reverse=True)
         items = dedupe.dedupe_items(items)
+        enrichment_request = {
+            "source": source,
+            "phase": "post_ranking_enrichment",
+            "topic": topic,
+            "depth": depth,
+        }
         if source == "youtube" and items and not mock:
             # Same budget-at-the-survivors principle as the digg branch
             # below: retrieval-time transcripts go to each search's
@@ -821,13 +844,18 @@ def _finalize_items_by_source(
             # relevance. Backfill survivors that arrived without one so the
             # transcript budget lands on videos the brief actually shows
             # (#542).
-            sc_token = (
-                config.get("SCRAPECREATORS_API_KEY")
-                if config and env.is_youtube_sc_available(config) else None
-            )
-            youtube_yt.backfill_transcripts(
-                items, topic=topic, depth=depth, token=sc_token,
-            )
+            matched, replayed = http.fixture_source_replay(enrichment_request)
+            if matched:
+                items = _merge_replayed_enrichment(items, replayed)
+            else:
+                sc_token = (
+                    config.get("SCRAPECREATORS_API_KEY")
+                    if config and env.is_youtube_sc_available(config) else None
+                )
+                youtube_yt.backfill_transcripts(
+                    items, topic=topic, depth=depth, token=sc_token,
+                )
+                http.fixture_source_record(enrichment_request, schema.to_dict(items))
         # Post-merge topic-relevance filter for Polymarket: comparison queries
         # fan out into per-entity subqueries ("Hermes", "OpenClaw") whose topic
         # is too narrow for Gamma API to filter meaningfully. Re-validating the
@@ -845,9 +873,35 @@ def _finalize_items_by_source(
             # in the brief. Spending the enrichment budget here (rather than
             # at retrieval time) keeps the inline 'via Digg' quotes
             # paired with the clusters dedupe actually kept.
-            digg.enrich_source_items(items, top_k=3)
+            matched, replayed = http.fixture_source_replay(enrichment_request)
+            if matched:
+                items = _merge_replayed_enrichment(items, replayed)
+            else:
+                digg.enrich_source_items(items, top_k=3)
+                http.fixture_source_record(enrichment_request, schema.to_dict(items))
         finalized[source] = items
     return finalized
+
+
+def _merge_replayed_enrichment(
+    items: list[schema.SourceItem],
+    replayed: list[dict],
+) -> list[schema.SourceItem]:
+    """Apply recorded post-ranking enrichment onto freshly computed items.
+
+    Enrichment (transcripts, Digg posts) only mutates ``metadata``. Merging by
+    item_id instead of replacing the list keeps normalization, scoring, and
+    dedupe regressions visible to the eval - fixture state must not overwrite
+    what the current pipeline computed.
+    """
+    replayed_by_id = {
+        entry.get("item_id"): entry for entry in replayed if isinstance(entry, dict)
+    }
+    for item in items:
+        record = replayed_by_id.get(item.item_id)
+        if record and record.get("metadata"):
+            item.metadata.update(record["metadata"])
+    return items
 
 
 def _apply_hiring_signal_gate(
@@ -1533,13 +1587,42 @@ def _merge_reddit_items(free: list[dict], sc: list[dict]) -> list[dict]:
 
 def _retrieve_stream(*args, **kwargs) -> tuple[list[dict], dict]:
     """Run one stream and retain HTTP failures swallowed by source adapters."""
+    source = str(kwargs.get("source") or "")
+    fixture_request = {
+        "source": source,
+        "topic": kwargs.get("topic") or "",
+        "search_query": getattr(kwargs.get("subquery"), "search_query", ""),
+        "date_range": list(kwargs.get("date_range") or ()),
+        "depth": kwargs.get("depth") or "",
+    }
+    module_backed = source in {
+        "reddit",
+        "x",
+        "youtube",
+        "stocktwits",
+        "digg",
+        "arxiv",
+        "techmeme",
+        "trustpilot",
+        "github",
+    }
+    if module_backed:
+        matched, replayed = http.fixture_source_replay(fixture_request)
+        if matched:
+            return replayed[0], replayed[1]
     try:
-        with http.capture_failures() as failures:
+        with http.capture_failures() as failures, \
+             http.fixture_module_capture(module_backed):
             items, artifact = _retrieve_stream_impl(*args, **kwargs)
     except Exception as exc:
+        recorded_exc = exc
         if failures and not getattr(exc, "outcome_state", None):
             failure = failures[-1]
-            raise SourceRunError(str(exc), failure.outcome_state) from exc
+            recorded_exc = SourceRunError(str(exc), failure.outcome_state)
+        if module_backed:
+            http.fixture_source_record_error(fixture_request, recorded_exc)
+        if recorded_exc is not exc:
+            raise recorded_exc from exc
         raise
     outcome_note = _resolve_stream_outcome(
         str(kwargs.get("source") or ""),
@@ -1549,6 +1632,8 @@ def _retrieve_stream(*args, **kwargs) -> tuple[list[dict], dict]:
     if outcome_note:
         artifact = dict(artifact or {})
         artifact["_source_outcome"] = outcome_note
+    if module_backed:
+        http.fixture_source_record(fixture_request, [items, artifact])
     return items, artifact
 
 
