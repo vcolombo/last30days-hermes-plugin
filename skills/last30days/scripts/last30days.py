@@ -11,6 +11,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import sys
 import threading
 from pathlib import Path
@@ -164,6 +165,26 @@ def save_output(
             continue
         with os.fdopen(fd, "wb") as f:
             f.write(encoded)
+        if candidate.suffix.lower() == ".md":
+            try:
+                from lib import library, library_index
+
+                save_root = candidate.parent.resolve()
+                if save_root == Path(library.DEFAULT_MEMORY_DIR).expanduser().resolve():
+                    library_index.sync_library(save_root)
+                else:
+                    # A scoped save must sync a per-directory index with the
+                    # same paths scoped search uses; syncing the shared DB
+                    # from one scope's scan would prune other scopes' rows.
+                    library_index.sync_library(
+                        save_root,
+                        save_root / "briefings",
+                        db_path=save_root / ".last30days-library.db",
+                    )
+            except (library_index.LibrarySearchUnavailable, OSError, sqlite3.DatabaseError):
+                # Saving research must not depend on the optional local index;
+                # `library search` reports a clear capability error on demand.
+                pass
         return candidate
     # Fallback: all 101 candidates existed (extremely unlikely).
     raise RuntimeError(
@@ -340,27 +361,36 @@ def read_synthesis_file(path: str) -> str:
         raise SystemExit(2)
 
 
-def persist_report(report: schema.Report) -> dict[str, int]:
+def _scoped_store_db(args: argparse.Namespace) -> Path | None:
+    """Scoped runs write findings inside the save dir, matching scoped reads."""
+    save_dir = getattr(args, "save_dir", None)
+    if save_dir:
+        return Path(save_dir).expanduser().resolve() / "research.db"
+    return None
+
+
+def persist_report(report: schema.Report, store_db: Path | None = None) -> dict[str, int]:
     import store
 
-    store.init_db()
-    topic_row = store.add_topic(report.topic)
-    topic_id = topic_row["id"]
-    source_mode = ",".join(sorted(report.items_by_source)) or "v3"
-    run_id = store.record_run(topic_id, source_mode=source_mode, status="running")
-    try:
-        findings = store.findings_from_report(report)
-        counts = store.store_findings(run_id, topic_id, findings)
-        store.update_run(
-            run_id,
-            status="completed",
-            findings_new=counts["new"],
-            findings_updated=counts["updated"],
-        )
-        return counts
-    except Exception as exc:
-        store.update_run(run_id, status="failed", error_message=str(exc)[:500])
-        raise
+    with store.scoped_db(store_db):
+        store.init_db()
+        topic_row = store.add_topic(report.topic)
+        topic_id = topic_row["id"]
+        source_mode = ",".join(sorted(report.items_by_source)) or "v3"
+        run_id = store.record_run(topic_id, source_mode=source_mode, status="running")
+        try:
+            findings = store.findings_from_report(report)
+            counts = store.store_findings(run_id, topic_id, findings)
+            store.update_run(
+                run_id,
+                status="completed",
+                findings_new=counts["new"],
+                findings_updated=counts["updated"],
+            )
+            return counts
+        except Exception as exc:
+            store.update_run(run_id, status="failed", error_message=str(exc)[:500])
+            raise
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -989,7 +1019,7 @@ def _run_drill(
         or ""
     ).lower()
     if args.store or store_default in {"1", "true", "yes"}:
-        counts = persist_report(merged)
+        counts = persist_report(merged, store_db=_scoped_store_db(args))
         sys.stderr.write(
             f"[last30days] Stored {counts['new']} new, "
             f"{counts['updated']} updated findings\n"
@@ -1346,18 +1376,24 @@ def _validate_extra_argv(parser: argparse.ArgumentParser, topic: str, extra_argv
 
 
 def _config_policy_for_args(args: argparse.Namespace, topic: str, extra_argv: list[str]) -> env.ConfigLoadPolicy:
+    normalized_topic = topic.lower()
+    is_library_command = (
+        normalized_topic == "library feed"
+        or normalized_topic == "library search"
+        or normalized_topic.startswith("library search ")
+    )
     if args.no_browser_cookies:
         browser_mode = "off"
-    elif args.diagnose or args.preflight or topic.lower() in {"doctor", "library feed"}:
+    elif args.diagnose or args.preflight or normalized_topic == "doctor" or is_library_command:
         # doctor is plan-only like --diagnose: it must never read cookies.
         browser_mode = "plan_only"
-    elif topic.lower() == "setup":
+    elif normalized_topic == "setup":
         browser_mode = "read" if _setup_allows_browser_cookies(args, extra_argv) else "off"
     else:
         browser_mode = "read"
     return env.ConfigLoadPolicy(
         browser_cookies=browser_mode,
-        inspect_ignored_project_config=args.diagnose or args.preflight or topic.lower() == "doctor",
+        inspect_ignored_project_config=args.diagnose or args.preflight or normalized_topic == "doctor",
     )
 
 
@@ -1519,6 +1555,63 @@ def _run_library_feed(args: argparse.Namespace, config: dict[str, object]) -> in
     return 0
 
 
+def _run_library_search(
+    args: argparse.Namespace,
+    config: dict[str, object],
+    query: str,
+) -> int:
+    """Search saved briefs and store sightings without network access."""
+    from lib import library, library_index
+
+    if not query.strip():
+        sys.stderr.write("[last30days] library search requires a non-empty query.\n")
+        return 2
+    if args.publish or args.publish_html:
+        sys.stderr.write("[last30days] library search does not publish output.\n")
+        return 2
+    if args.emit != "compact":
+        sys.stderr.write("[last30days] library search currently supports text output only.\n")
+        return 2
+    if args.output:
+        sys.stderr.write(
+            "[last30days] library search prints to stdout; --output is not supported.\n"
+        )
+        return 2
+
+    memory_dir = Path(args.save_dir).expanduser() if args.save_dir else library.DEFAULT_MEMORY_DIR
+    try:
+        matches, synced = library_index.sync_and_search(
+            query,
+            memory_dir=memory_dir,
+            briefs_dir=(
+                memory_dir / "briefings" if args.save_dir else library.DEFAULT_BRIEFS_DIR
+            ),
+            db_path=(
+                memory_dir.resolve() / ".last30days-library.db"
+                if args.save_dir else library_index.DEFAULT_LIBRARY_DB
+            ),
+            # A scoped search must never merge in the shared store: one
+            # client's sightings would leak into another client's scope. A
+            # scoped store is read only if it exists inside the save dir.
+            store_db_path=(
+                memory_dir.resolve() / "research.db"
+                if args.save_dir else library_index.DEFAULT_STORE_DB
+            ),
+        )
+    except library_index.LibrarySearchUnavailable as exc:
+        sys.stderr.write(f"[last30days] Library search unavailable: {exc}.\n")
+        return 2
+    except (OSError, sqlite3.DatabaseError) as exc:
+        sys.stderr.write(f"[last30days] Library search failed: {exc}.\n")
+        return 1
+    for note in synced.notes:
+        sys.stderr.write(f"[last30days] Library note: {note}\n")
+    if synced.rebuilt:
+        sys.stderr.write("[last30days] Rebuilt a corrupt library search index.\n")
+    print(render.render_library_search(query, matches), end="")
+    return 0
+
+
 def main() -> int:
     parser = build_parser()
     # Use parse_known_args so setup sub-flags (--device-auth, --github,
@@ -1602,6 +1695,8 @@ def _main(
 
     if topic.lower() == "library feed":
         return _run_library_feed(args, config)
+    if topic.lower() == "library search" or topic.lower().startswith("library search "):
+        return _run_library_search(args, config, topic[len("library search") :].strip())
 
     # Handle setup subcommand
     if topic.lower() == "setup":
@@ -1938,6 +2033,7 @@ def _main(
                 trustpilot_domain_is_hint=trustpilot_domain_is_hint,
                 internal_subrun=comp_enabled,
                 hiring_signals_mode=args.hiring_signals,
+                save_dir=args.save_dir,
             )
             r.artifacts["resolved"] = {
                 "entity": topic,
@@ -2074,6 +2170,7 @@ def _main(
                     as_of_date=args.as_of_date,
                     hiring_signals_mode=args.hiring_signals,
                     internal_subrun=True,
+                    save_dir=args.save_dir,
                 )
                 report.artifacts["resolved"] = resolved_effective
                 return report
@@ -2116,7 +2213,7 @@ def _main(
         or ""
     ).lower()
     if args.store or _store_env in ("1", "true", "yes"):
-        counts = persist_report(report)
+        counts = persist_report(report, store_db=_scoped_store_db(args))
         sys.stderr.write(
             f"[last30days] Stored {counts['new']} new, {counts['updated']} updated findings\n"
         )
