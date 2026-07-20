@@ -2255,9 +2255,12 @@ def _main(
     # Injected-only mode (--inject-results) and plan-only mode (--plan-queries)
     # must keep this pre-run diagnose network-free: probe mode spawns a live
     # `xurl whoami` and a bird probe, and neither mode ever fetches X.
+    # `is not None` (not bool()) so an empty --inject-results path still counts
+    # as two-phase mode here — otherwise diagnose probes X live before the
+    # empty path fails at the load guard below.
     diag = pipeline.diagnose(
         config, requested_sources,
-        safe=args.diagnose or bool(args.inject_results)
+        safe=args.diagnose or args.inject_results is not None
         or bool(args.plan_queries))
 
     if args.diagnose:
