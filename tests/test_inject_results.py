@@ -74,6 +74,14 @@ WEB_ITEM = {
 }
 
 
+WEB_ITEM_NO_DATE = {
+    "id": "WND1", "title": "Undated web roundup",
+    "url": "https://example.org/undated", "source_domain": "example.org",
+    "snippet": "all about test topic, no publication date",
+    "date": None, "relevance": 0.8, "why_relevant": "hermes web_search",
+}
+
+
 class TestInjectResults:
     def _pipeline(self):
         sys.path.insert(0, str(SCRIPTS))
@@ -82,6 +90,48 @@ class TestInjectResults:
         finally:
             sys.path.remove(str(SCRIPTS))
         return pipeline
+
+    def _normalize(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            from lib import normalize
+        finally:
+            sys.path.remove(str(SCRIPTS))
+        return normalize
+
+    def test_injected_dateless_grounding_survives_only_with_override(self):
+        """Hermes web_search returns no dates. The grounding require-date gate
+        must drop them by default but keep them when the inject override is on
+        (else the whole injected web stream vanishes — the 2026-07-20 bug)."""
+        normalize = self._normalize()
+        frm, to = "2026-06-20", "2026-07-20"
+        dropped = normalize.normalize_source_items(
+            "grounding", [WEB_ITEM_NO_DATE], frm, to)
+        assert dropped == []  # default require_date=True drops dateless
+        kept = normalize.normalize_source_items(
+            "grounding", [WEB_ITEM_NO_DATE], frm, to, require_date=False)
+        assert len(kept) == 1
+        assert kept[0].url == "https://example.org/undated"
+
+    def test_inject_run_keeps_dateless_web(self, tmp_path):
+        """A phase-3 inject run must surface dateless injected web items
+        (require_date relaxed for injected grounding)."""
+        payload = _run_plan_queries(tmp_path)
+        web_q = next(q["search_query"] for q in payload["queries"]
+                     if q["source"] == "web")
+        inject = {"x": {}, "web": {web_q: [WEB_ITEM_NO_DATE]}}
+        inject_file = tmp_path / "inject.json"
+        inject_file.write_text(json.dumps(inject), encoding="utf-8")
+        plan_file = tmp_path / "plan-only.json"
+        plan_file.write_text(json.dumps(payload["plan"]), encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic",
+             "--plan", str(plan_file), "--inject-results", str(inject_file),
+             "--search", "grounding", "--mock", "--emit", "compact"],
+            capture_output=True, text=True, timeout=180,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "example.org/undated" in proc.stdout
 
     def test_injected_results_membership_semantics(self):
         pipeline = self._pipeline()

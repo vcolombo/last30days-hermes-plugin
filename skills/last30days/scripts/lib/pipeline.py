@@ -1685,6 +1685,15 @@ def run(
                 source, raw_items, from_date, to_date,
                 freshness_mode=plan.freshness_mode,
                 ranking_query=subquery.ranking_query,
+                # Injected web (two-phase hosts, e.g. the Hermes plugin) comes
+                # from an agent tool with no publication dates; don't drop the
+                # whole stream on the grounding require-date gate.
+                require_date=(
+                    False
+                    if source == "grounding"
+                    and config.get("_inject_results") is not None
+                    else None
+                ),
             )
             # Jobs is exempt from per_stream_limit: a careers board is a complete
             # snapshot of open roles, and truncating it to the default 12 drops
@@ -2064,11 +2073,13 @@ def _normalize_score_dedupe(
     to_date: str,
     freshness_mode: str,
     ranking_query: str,
+    require_date: bool | None = None,
 ) -> list[schema.SourceItem]:
     """Normalize, annotate, prune, dedupe, and extract snippets for a batch of raw items."""
     normalized = normalize.normalize_source_items(
         source, raw_items, from_date, to_date,
         freshness_mode=freshness_mode,
+        require_date=require_date,
     )
     prepared_query = relevance.PreparedQuery(ranking_query)
     lookback_window_days = (
