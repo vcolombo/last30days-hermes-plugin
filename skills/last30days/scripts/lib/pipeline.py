@@ -1323,10 +1323,13 @@ def run(
         available = [s for s in available if s != "grounding"]
     elif web_backend in ("brave", "exa", "serper", "parallel", "keyless") and "grounding" not in available:
         available.append("grounding")
-    if plan_queries_only:
+    if plan_queries_only or config.get("_inject_results") is not None:
         # Two-phase hosts (Hermes plugin) fetch X/web themselves via the
         # agent's own tools, so the planner must assign those queries even
-        # when this environment has no X/web credentials.
+        # when this environment has no X/web credentials. The same applies
+        # to the inject run: injected results must reach the seam even
+        # without X/web credentials; misses still return empty
+        # (injected-only policy).
         for source in ("x", "grounding"):
             if source not in available:
                 available.append(source)

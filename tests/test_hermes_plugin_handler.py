@@ -111,6 +111,24 @@ class TestHandler:
         assert statuses["x1"] == "failed"
         assert result["warnings"]
 
+    def test_success_envelope_warnings_are_redacted(self, monkeypatch):
+        """Env secrets leaking into dispatch-failure messages must be masked
+        in the success envelope's warnings, same as error stderr tails."""
+        monkeypatch.setenv("FAKE_API_KEY", "secret12345")
+
+        class LeakyCtx(FakeCtx):
+            def dispatch_tool(self, name, args, **kwargs):
+                if name == "x_search":
+                    raise RuntimeError("auth failed with secret12345")
+                return super().dispatch_tool(name, args, **kwargs)
+
+        result = self._invoke(monkeypatch, LeakyCtx())
+        assert result["ok"] is True
+        assert result["warnings"]
+        joined = " ".join(result["warnings"])
+        assert "secret12345" not in joined
+        assert "<FAKE_API_KEY>" in joined
+
     def test_research_subprocess_failure_returns_error_envelope(self, monkeypatch):
         ctx = FakeCtx()
         result = self._invoke(

@@ -94,9 +94,10 @@ def _handler(ctx, args: dict) -> str:
         except (TypeError, ValueError):
             return _error("plan", f"invalid lookback_days: {lookback!r}")
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="last30days-hermes-"))
+    tmpdir: Path | None = None
     timings: dict[str, float] = {}
     try:
+        tmpdir = Path(tempfile.mkdtemp(prefix="last30days-hermes-"))
         # Phase 1: plan
         t0 = time.monotonic()
         plan_out = tmpdir / "plan-queries.json"
@@ -139,7 +140,7 @@ def _handler(ctx, args: dict) -> str:
             "ok": True,
             "report": proc.stdout,
             "coverage": coverage,
-            "warnings": warnings,
+            "warnings": [_redact(w) for w in warnings],
             "timings": timings,
             "meta": {"topic": topic, "depth": depth, "emit": emit,
                      "from_date": payload.get("from_date"),
@@ -148,7 +149,8 @@ def _handler(ctx, args: dict) -> str:
     except Exception as exc:  # never raise into the registry
         return _error("fetch", f"{type(exc).__name__}: {exc}")
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _fetch_all(ctx, payload: dict, depth: str):
@@ -178,12 +180,9 @@ def _fetch_all(ctx, payload: dict, depth: str):
             else:
                 items = _fetch_web(ctx, query, payload)
                 inject["web"][query] = items
+            # An empty list is still injected: a real zero-result hit.
             per_query.append(
-                {**q, "status": "injected" if items else "empty",
-                 "items": len(items)})
-            if not items:
-                # An empty list is still injected: a real zero-result hit.
-                per_query[-1]["status"] = "injected"
+                {**q, "status": "injected", "items": len(items)})
         except Exception as exc:
             warnings.append(f"{qid} ({source}): {type(exc).__name__}: {exc}")
             per_query.append({**q, "status": "failed", "items": 0})

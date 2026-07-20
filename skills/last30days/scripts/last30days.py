@@ -2435,7 +2435,9 @@ def _main(
             )
             from_date, to_date = dates.get_date_range(
                 args.lookback_days, as_of_date=args.as_of_date)
-            x_cap = config.get("_max_source_fetches") or pipeline.MAX_SOURCE_FETCHES["x"]
+            x_cap = config.get("_max_source_fetches")
+            if x_cap is None:
+                x_cap = pipeline.MAX_SOURCE_FETCHES["x"]
             queries = []
             x_count = 0
             for index, sq in enumerate(plan.subqueries, start=1):

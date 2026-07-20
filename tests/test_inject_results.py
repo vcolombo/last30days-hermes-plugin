@@ -121,6 +121,38 @@ class TestInjectResults:
         assert "x.com/someone/status/123456" in proc.stdout or \
                "example.com/a" in proc.stdout
 
+    def test_inject_mode_forces_x_available_without_credentials(self, tmp_path):
+        """Injected results must reach the seam even when the engine env has
+        no X/web credentials (OAuth-only Hermes hosts). Without the inject-mode
+        availability force-add, _sanitize_plan strips x from every subquery and
+        the injected items are silently discarded. Runs WITHOUT --mock so real
+        availability logic applies; zero network because every x query is
+        injected, grounding is disabled, and other sources are excluded."""
+        payload = _run_plan_queries(tmp_path)
+        inject = {"x": {}, "web": {}}
+        for q in payload["queries"]:
+            if q["source"] == "x":
+                inject["x"][q["search_query"]] = [X_ITEM]
+        inject_file = tmp_path / "inject.json"
+        inject_file.write_text(json.dumps(inject), encoding="utf-8")
+        plan_file = tmp_path / "plan-only.json"
+        plan_file.write_text(json.dumps(payload["plan"]), encoding="utf-8")
+
+        import os
+        env = {"PATH": os.environ.get("PATH", ""),
+               "HOME": str(tmp_path),  # no user config, no keys
+               "LAST30DAYS_CONFIG_DIR": ""}
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic",
+             "--plan", str(plan_file),
+             "--inject-results", str(inject_file),
+             "--search", "x", "--web-backend", "none",
+             "--emit", "compact"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "x.com/someone/status/123456" in proc.stdout
+
     def test_inject_miss_is_quiet_no_coverage(self, tmp_path):
         """A subquery not present in the inject map must not raise and must
         not fall through to live backends (injected-only policy)."""
