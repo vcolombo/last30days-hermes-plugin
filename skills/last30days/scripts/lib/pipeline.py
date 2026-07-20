@@ -1275,7 +1275,8 @@ def run(
     save_dir: Path | str | None = None,
     corpus_dirs: list[str] | None = None,
     corpus_all_time: bool = False,
-) -> schema.Report:
+    plan_queries_only: bool = False,
+) -> schema.Report | schema.QueryPlan:
     settings = _resolve_depth_settings(depth, config)
     requested_sources = normalize_requested_sources(requested_sources)
     from_date, to_date = dates.get_date_range(lookback_days, as_of_date=as_of_date)
@@ -1322,6 +1323,13 @@ def run(
         available = [s for s in available if s != "grounding"]
     elif web_backend in ("brave", "exa", "serper", "parallel", "keyless") and "grounding" not in available:
         available.append("grounding")
+    if plan_queries_only:
+        # Two-phase hosts (Hermes plugin) fetch X/web themselves via the
+        # agent's own tools, so the planner must assign those queries even
+        # when this environment has no X/web credentials.
+        for source in ("x", "grounding"):
+            if source not in available:
+                available.append(source)
     if (hiring_signals_mode or _company_topic_likely(topic)) and "jobs" not in available:
         available.append("jobs")
     if hiring_signals_mode:
@@ -1408,6 +1416,9 @@ def run(
             )
     else:
         print("[Planner]   (no subqueries in plan)", file=sys.stderr)
+
+    if plan_queries_only:
+        return plan
 
     bundle = schema.RetrievalBundle(artifacts={"grounding": []})
     for source in (requested_sources or []):
