@@ -1210,6 +1210,29 @@ class RecencyUnverifiedCoverageTests(unittest.TestCase):
         line = "\n".join(render._render_source_coverage(report))
         self.assertNotIn("recency-unverified", line)
 
+    def _item_eng(self, source, eng_verified):
+        return schema.SourceItem(
+            item_id="x", source=source, title="T", body="b",
+            url="https://ex.com/a", engagement_verified=eng_verified)
+
+    def test_model_reported_engagement_count_shown(self):
+        report = self._report([
+            self._item_eng("x", False),
+            self._item_eng("x", False),
+            self._item_eng("x", None),
+        ])
+        line = "\n".join(render._render_source_coverage(report))
+        self.assertIn("2 model-reported engagement", line)
+
+    def test_both_notes_combined(self):
+        it = schema.SourceItem(
+            item_id="x", source="x", title="T", body="b",
+            url="https://ex.com/a", recency_verified=False,
+            engagement_verified=False)
+        report = self._report([it])
+        line = "\n".join(render._render_source_coverage(report))
+        self.assertIn("1 recency-unverified; 1 model-reported engagement", line)
+
 
 class RecencyVerifiedSchemaTests(unittest.TestCase):
     def test_round_trips_through_dict(self):

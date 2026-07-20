@@ -402,6 +402,7 @@ class TestCitationFallback:
                         "https://x.com/alice/status/111"]
         assert all(i["engagement"] is None for i in items)
         assert all(i["why_relevant"] == "citation-fallback" for i in items)
+        assert all(i["engagement_verified"] is False for i in items)
 
 
 X_SUCCESS_ITEMS_FIXTURE = (

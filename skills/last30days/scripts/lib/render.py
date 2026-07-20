@@ -1858,11 +1858,18 @@ def _render_source_coverage(report: schema.Report) -> list[str]:
     for source in sources:
         items = report.items_by_source.get(source, [])
         line = f"- {_source_label(source)}: {len(items)} item{'s' if len(items) != 1 else ''}"
+        # Provenance notes so the synthesizer does not over-claim: evidence with
+        # no in-window publication date is not proven "last N days", and
+        # model-reported engagement (injected X) is not authoritative platform metrics.
+        notes = []
         unverified = sum(1 for it in items if it.recency_verified is False)
         if unverified:
-            # Flag evidence with no in-window publication date so the
-            # synthesizer does not present it as proven "last N days".
-            line += f" ({unverified} recency-unverified)"
+            notes.append(f"{unverified} recency-unverified")
+        model_eng = sum(1 for it in items if it.engagement_verified is False)
+        if model_eng:
+            notes.append(f"{model_eng} model-reported engagement")
+        if notes:
+            line += f" ({'; '.join(notes)})"
         outcome = report.source_status.get(source)
         if outcome and outcome.state != health.OK:
             line += f" ({_format_outcome(outcome)})"

@@ -91,6 +91,11 @@ class SourceItem:
     # is False — usable for corroboration but NOT provable "last N days".
     recency_verified: bool | None = None
     engagement: dict[str, float | int] = field(default_factory=dict)
+    # Provenance: False iff engagement counts are model-reported (e.g. injected
+    # X from Hermes x_search / xAI, where grok estimates likes/reposts) rather
+    # than scraped from an authoritative platform API (bird cookies, xquik).
+    # None = not assessed. Model-reported counts must not be cited as authoritative.
+    engagement_verified: bool | None = None
     relevance_hint: float = 0.5
     why_relevant: str = ""
     snippet: str = ""
@@ -437,6 +442,7 @@ def source_item_from_dict(payload: dict[str, Any]) -> SourceItem:
         date_confidence=payload.get("date_confidence") or "low",
         recency_verified=payload.get("recency_verified"),
         engagement=dict(payload.get("engagement") or {}),
+        engagement_verified=payload.get("engagement_verified"),
         relevance_hint=float(_first_non_none(payload.get("relevance_hint"), 0.5)),
         why_relevant=payload.get("why_relevant") or "",
         snippet=payload.get("snippet") or "",
