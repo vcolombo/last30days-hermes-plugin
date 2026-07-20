@@ -239,7 +239,14 @@ def _dispatch(ctx, name: str, args: dict, timeout_s: float | None = None) -> str
             slots.release()
 
     t = threading.Thread(target=_run, name=f"last30days-{name}", daemon=True)
-    t.start()
+    try:
+        t.start()
+    except BaseException:
+        # The worker never ran, so its finally won't release. Return the slot
+        # we acquired, else a transient thread-start failure permanently
+        # drains the pool.
+        slots.release()
+        raise
     t.join(timeout_s)
     if t.is_alive():
         raise RuntimeError(f"{name} dispatch timed out after {timeout_s:.0f}s")
