@@ -200,7 +200,7 @@ def available_sources(
         # diagnose() precomputes the predicate and passes it via x_pending to
         # avoid evaluating it twice in one diagnose() call.
         if x_pending is None:
-            x_pending = env.x_pending_browser_auth(config)
+            x_pending = env.x_pending_browser_auth(config, local_only=local_only)
         if x_pending:
             available.append("x")
     if which("yt-dlp") or env.is_youtube_sc_available(config):
@@ -1275,7 +1275,8 @@ def run(
     save_dir: Path | str | None = None,
     corpus_dirs: list[str] | None = None,
     corpus_all_time: bool = False,
-) -> schema.Report:
+    plan_queries_only: bool = False,
+) -> schema.Report | schema.QueryPlan:
     settings = _resolve_depth_settings(depth, config)
     requested_sources = normalize_requested_sources(requested_sources)
     from_date, to_date = dates.get_date_range(lookback_days, as_of_date=as_of_date)
@@ -1309,8 +1310,21 @@ def run(
         if not requested_sources and not hiring_signals_mode and not _company_topic_likely(topic):
             available = [source for source in available if source != "jobs"]
     else:
+        if plan_queries_only:
+            # Plan-only mode never fetches X; keep backend resolution and
+            # availability probing network-free (xurl availability is a live
+            # authenticated `xurl whoami`). Mirror the inject-mode guard.
+            config = {**config, "_plan_queries_only": True}
         runtime, reasoning_provider = providers.resolve_runtime(config, depth)
-        available = available_sources(config, requested_sources)
+        available = available_sources(
+            config,
+            requested_sources,
+            # Injected-only and plan-only modes must not probe X backends over
+            # the network (xurl's availability check is a live authenticated
+            # `xurl whoami`).
+            local_only=(config.get("_inject_results") is not None
+                        or config.get("_plan_queries_only") is True),
+        )
         if requested_sources:
             available = [source for source in available if source in requested_sources]
     # Keep an explicitly requested but unconfigured corpus in the plan long
@@ -1322,6 +1336,16 @@ def run(
         available = [s for s in available if s != "grounding"]
     elif web_backend in ("brave", "exa", "serper", "parallel", "keyless") and "grounding" not in available:
         available.append("grounding")
+    if plan_queries_only or config.get("_inject_results") is not None:
+        # Two-phase hosts (Hermes plugin) fetch X/web themselves via the
+        # agent's own tools, so the planner must assign those queries even
+        # when this environment has no X/web credentials. The same applies
+        # to the inject run: injected results must reach the seam even
+        # without X/web credentials; misses still return empty
+        # (injected-only policy).
+        for source in ("x", "grounding"):
+            if source not in available:
+                available.append(source)
     if (hiring_signals_mode or _company_topic_likely(topic)) and "jobs" not in available:
         available.append("jobs")
     if hiring_signals_mode:
@@ -1408,6 +1432,9 @@ def run(
             )
     else:
         print("[Planner]   (no subqueries in plan)", file=sys.stderr)
+
+    if plan_queries_only:
+        return plan
 
     bundle = schema.RetrievalBundle(artifacts={"grounding": []})
     for source in (requested_sources or []):
@@ -2468,6 +2495,11 @@ def _run_supplemental_searches(
     if depth == "quick" or mock:
         return
 
+    if config.get("_inject_results") is not None:
+        # Injected-only mode (Hermes plugin): supplemental X lanes are live
+        # credentialed fetches with no injection seam — skip them entirely.
+        return
+
     from_date, to_date = date_range
 
     # Convert SourceItems to dicts for entity_extract. All X items (whatever
@@ -2888,6 +2920,24 @@ def _retrieve_stream(*args, **kwargs) -> tuple[list[dict], dict]:
     return items, artifact
 
 
+def _injected_results(config: dict[str, Any], kind: str, query: str) -> list[dict] | None:
+    """Pre-fetched results injected via --inject-results for (kind, query).
+
+    Returns the injected list on a hit, or None on a miss. Membership-based:
+    an empty list is a real zero-result hit, never a fallthrough to live
+    backends (injected-only policy — the host that injected results owns the
+    X/web credentials; this process must not use its own).
+    """
+    inj = config.get("_inject_results")
+    if not isinstance(inj, dict):
+        return None
+    bucket = inj.get(kind)
+    if isinstance(bucket, dict) and query in bucket:
+        items = bucket[query]
+        return items if isinstance(items, list) else []
+    return None
+
+
 def _retrieve_stream_impl(
     *,
     topic: str,
@@ -2913,6 +2963,26 @@ def _retrieve_stream_impl(
     if rate_limited_sources is not None and source in rate_limited_sources:
         return [], {}
     from_date, to_date = date_range
+    if source in ("grounding", "x") and config.get("_inject_results") is not None:
+        kind = "web" if source == "grounding" else "x"
+        injected = _injected_results(config, kind, subquery.search_query)
+        if injected is None:
+            # Injected-only mode: dynamically generated queries (retry-thin,
+            # x-handle supplementals) are outside the inject map — report
+            # quiet no-coverage instead of spending this env's credentials.
+            print(
+                f"[Inject] no injected {kind} results for "
+                f"'{subquery.search_query}' — skipping (injected-only mode)",
+                file=sys.stderr,
+            )
+            return [], {}
+        if source == "grounding":
+            return injected, {
+                "label": "injected",
+                "webSearchQueries": [subquery.search_query],
+                "resultCount": len(injected),
+            }
+        return injected, {}
     if mock:
         return _mock_stream_results(source, subquery)
     if source == "grounding":

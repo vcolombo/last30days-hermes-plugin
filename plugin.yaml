@@ -1,0 +1,10 @@
+name: last30days
+version: "3.16.0"
+description: >-
+  Research any topic across Reddit, X, YouTube, Hacker News, Polymarket, and
+  the web (last 30 days). X and web fetches ride the agent's own x_search /
+  web_search tools — no separate credentials.
+author: mvanhorn
+provides_tools:
+  - last30days_research
+requires_env: []

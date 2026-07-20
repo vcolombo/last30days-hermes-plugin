@@ -578,6 +578,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hiring-signals", action="store_true",
                         help="Analyze public jobs/careers postings as evidence-backed company focus signals.")
     parser.add_argument("--plan", help="JSON query plan (skips internal LLM planner). Can be a JSON string or a file path.")
+    parser.add_argument("--plan-queries", action="store_true",
+                        help="Plan only: write the X/web queries this run would execute as JSON "
+                             "and exit without fetching. Single-entity topics only (competitors/"
+                             "vs-mode unsupported). Used by two-phase hosts (e.g. the Hermes plugin).")
+    parser.add_argument("--plan-queries-out",
+                        help="File path for --plan-queries JSON output (default: stdout)")
+    parser.add_argument("--inject-results",
+                        help="JSON file of pre-fetched X/web results keyed by source then "
+                             "search_query ({\"x\": {q: [items]}, \"web\": {q: [items]}}). "
+                             "X/grounding then run injected-only: hits skip live fetch, "
+                             "misses are quiet no-coverage. Used with --plan by two-phase "
+                             "hosts (e.g. the Hermes plugin).")
     parser.add_argument("--save-suffix", help="Suffix for saved output filename (e.g., 'gemini' → kanye-west-raw-gemini.md)")
     parser.add_argument("--subreddits", help="Comma-separated broad/category subreddit names to search (e.g., SaaS,Entrepreneur)")
     parser.add_argument("--dedicated-subreddits", help="Comma-separated entity-home subreddit names (e.g., Kanye,WestSubEver). Pulled in full (top+hot+new) and exempt from the relevance floor since the whole sub is the topic.")
@@ -2231,7 +2243,13 @@ def _main(
         return hosted.run_hosted(topic, depth, **hosted_kwargs)
 
     requested_sources = resolve_requested_sources(args.search, config)
-    diag = pipeline.diagnose(config, requested_sources, safe=args.diagnose)
+    # Injected-only mode (--inject-results) and plan-only mode (--plan-queries)
+    # must keep this pre-run diagnose network-free: probe mode spawns a live
+    # `xurl whoami` and a bird probe, and neither mode ever fetches X.
+    diag = pipeline.diagnose(
+        config, requested_sources,
+        safe=args.diagnose or bool(args.inject_results)
+        or bool(args.plan_queries))
 
     if args.diagnose:
         print(json.dumps(diag, indent=2, sort_keys=True))
@@ -2330,6 +2348,15 @@ def _main(
                 # --plan file-read branch above and parse_competitors_plan.
                 raise SystemExit(2)
 
+        if args.inject_results:
+            import json as _json2
+            try:
+                with open(args.inject_results, encoding="utf-8") as f:
+                    config["_inject_results"] = _json2.load(f)
+            except (OSError, UnicodeDecodeError, _json2.JSONDecodeError) as exc:
+                sys.stderr.write(f"[Inject] Cannot read --inject-results file: {exc}\n")
+                raise SystemExit(2)
+
         # Auto-resolve: use web search to discover subreddits/handles before planning.
         # This is the engine-side equivalent of SKILL.md Steps 0.55/0.75 for platforms
         # without WebSearch (OpenClaw, Codex, raw CLI).
@@ -2395,6 +2422,52 @@ def _main(
             include = config.get("INCLUDE_SOURCES") or ""
             if "perplexity" not in include.lower():
                 config["INCLUDE_SOURCES"] = f"{include},perplexity" if include else "perplexity"
+
+        if args.plan_queries:
+            plan = pipeline.run(
+                topic=topic,
+                config=config,
+                depth=depth,
+                requested_sources=requested_sources,
+                mock=args.mock,
+                x_handle=args.x_handle,
+                x_related=x_related,
+                web_backend=args.web_backend,
+                external_plan=external_plan,
+                subreddits=subreddits,
+                lookback_days=args.lookback_days,
+                as_of_date=args.as_of_date,
+                plan_queries_only=True,
+            )
+            from_date, to_date = dates.get_date_range(
+                args.lookback_days, as_of_date=args.as_of_date)
+            x_cap = config.get("_max_source_fetches")
+            if x_cap is None:
+                x_cap = pipeline.MAX_SOURCE_FETCHES["x"]
+            queries = []
+            x_count = 0
+            for index, sq in enumerate(plan.subqueries, start=1):
+                if "x" in sq.sources and x_count < x_cap:
+                    x_count += 1
+                    queries.append({"id": f"x{x_count}", "source": "x",
+                                    "search_query": sq.search_query})
+                if "grounding" in sq.sources:
+                    queries.append({"id": f"w{index}", "source": "web",
+                                    "search_query": sq.search_query})
+            payload = {
+                "topic": topic,
+                "depth": depth,
+                "from_date": from_date,
+                "to_date": to_date,
+                "plan": schema.to_dict(plan),
+                "queries": queries,
+            }
+            rendered_json = json.dumps(payload, ensure_ascii=False, indent=2)
+            if args.plan_queries_out:
+                Path(args.plan_queries_out).write_text(rendered_json, encoding="utf-8")
+            else:
+                print(rendered_json)
+            return 0
 
         comp_enabled, comp_count, comp_explicit = resolve_competitors_args(args)
         comp_plan = parse_competitors_plan(args.competitors_plan)

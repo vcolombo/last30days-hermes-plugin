@@ -1,0 +1,1 @@
+{"success": false, "provider": "xai", "tool": "x_search", "error": "personal-team-blocked:spending-limit: You have run out of credits or need a Grok subscription. Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok.", "error_type": "HTTPError"}

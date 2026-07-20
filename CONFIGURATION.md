@@ -64,6 +64,8 @@ The engine's `.env` reader doesn't expand `$HOME` — only the tilde, via `Path(
 - `--publish-password <password>` - optional shared password for `--publish-html` or `library feed --publish`. Prefer `LAST30DAYS_PUBLISH_PASSWORD=<password>` instead so the password is not visible in the process list or shell history. Use a unique non-personal password; never reuse the user's own password. The provider's update key is treated as secret and is not written to stdout, HTML, raw output, or `.publish.json` metadata.
 - `--preflight` - print a human-readable permission preflight. It reports config source, project config trust/ignore state, browser-cookie plan, planned writes, optional commands, source availability, and endpoint overrides without reading browser cookies, writing setup/config/report files, or running research. Add `--emit=json` for the separate machine-readable preflight contract (`--json-profile` does not change it); use `--diagnose` when you need the full source diagnostic JSON.
 - `--welcome` - print the first-run welcome text (engine-owned; the skill relays it verbatim on first run). Safe: prints and exits, no reads or writes.
+- `--plan-queries` / `--plan-queries-out <file>` - plan-only mode: write the X/web queries the run would execute (plus the serialized plan) as JSON and exit without fetching anything. Built for two-phase hosts that fetch X/web through their own tools (e.g. the Hermes plugin). Single-entity topics only.
+- `--inject-results <file>` - JSON of pre-fetched X/web results, keyed by source then search query (`{"x": {query: [items]}, "web": {query: [items]}}`). X/web then run injected-only: a query present in the file uses the injected items and skips the live fetch, and a query absent from the file is a quiet no-coverage skip - the engine never spends its own X/web credentials in this mode. Use together with `--plan` from the same `--plan-queries` output so the queries match.
 - `--record-fixtures <dir>` - developer-only, hidden flag that records scrubbed source responses for the offline research-quality eval harness. It writes `<dir>/http.json`; see the [eval reference](docs/reference/eval.md) before recording or committing fixtures.
 - `setup --github-start` / `setup --github-poll` - the two-command ScrapeCreators GitHub device-auth split. `--github-start` submits the device flow, copies the code to the clipboard, opens the browser, and returns the code immediately (foreground); `--github-poll` waits for you to authorize and persists the key. `setup --github` still runs both in one shot for back-compat.
 
@@ -499,6 +501,11 @@ Claude Code manifests for compatibility; the native pair is the first-class lane
 marketplace catalog uses a bare Git URL source (no commit pin) so `grok plugin marketplace add
 mvanhorn/last30days-skill` tracks HEAD — the same pattern as the Codex catalog. `npx skills add`
 remains a valid cross-host fallback.
+
+**Hermes note:** on Hermes Agent, the native plugin install (`hermes plugins install
+vcolombo/last30days-hermes-plugin`) is the recommended path — it registers the `last30days_research`
+tool (X/web ride the agent's own `x_search`/`web_search` credentials) plus the bundled skill. Full
+instructions, requirements, and the flat-skill alternative live in [`HERMES_SETUP.md`](HERMES_SETUP.md).
 
 ### 1. Trusted per-client `.claude/last30days.env`
 

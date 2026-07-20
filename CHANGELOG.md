@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — Hermes Agent plugin
+
+### Added
+
+- Native Hermes plugin (`plugin.yaml` + root `__init__.py`) — install with `hermes plugins install vcolombo/last30days-hermes-plugin`. Registers the `last30days_research` tool (X/web ride the agent's own `x_search`/`web_search` credentials) and the bundled skill.
+- New engine flags: `--plan-queries` / `--plan-queries-out` (plan-only JSON) and `--inject-results` (pre-fetched X/web items, injected-only mode) for two-phase hosts.
 
 ## [3.16.0] - 2026-07-15
 

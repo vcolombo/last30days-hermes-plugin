@@ -8,7 +8,25 @@ This guide covers installing last30days on Hermes AI Agent.
 2. **Python 3.12+** - `brew install python@3.12` or similar
 3. **yt-dlp** (optional, for YouTube) - `brew install yt-dlp`
 
-## Installation
+## Plugin install (recommended)
+
+```bash
+hermes plugins install vcolombo/last30days-hermes-plugin
+hermes plugins enable last30days
+```
+
+This registers two things:
+
+- **Tool `last30days_research`** — a full research run as a native Hermes tool. X and web queries are fetched through the agent's own `x_search` / `web_search` tools, so **no separate X/web credentials are needed**. Every other source behaves exactly as in the skill install below: keyless Reddit/HN/Polymarket work out of the box, and ScrapeCreators-backed sources still read `SCRAPECREATORS_API_KEY` from the agent environment.
+- **Bundled skill** — load it with `skill_view("last30days:last30days")`. Plugin skills are explicit-load only; they do not appear in the system-prompt skill index.
+
+**Requirements:** `x_search` enabled (check with `hermes tools`; it needs xAI OAuth or `XAI_API_KEY` on the agent) and web search configured. The engine subprocess runs on the Hermes runtime Python via `sys.executable`, so no separate `python3.12` binary is needed for the plugin path.
+
+**Dual-install note:** installing the plugin does not remove or refresh a previously installed flat skill (`~/.hermes/skills/.../last30days`). If both are present, the plugin's bundled skill and tool are authoritative — uninstall the flat skill, or keep it deliberately pinned. Versions can drift otherwise.
+
+To update: `hermes plugins update last30days`.
+
+## Skill install (alternative)
 
 ```bash
 hermes skills install mvanhorn/last30days-skill/skills/last30days --force
