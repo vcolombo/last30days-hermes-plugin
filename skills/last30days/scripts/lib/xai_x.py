@@ -222,6 +222,8 @@ def parse_x_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
             "author_handle": _safe_text(item.get("author_handle", "")).strip().lstrip("@"),
             "date": item.get("date"),
             "engagement": engagement,
+            # grok estimates these counts — not scraped from the X API.
+            "engagement_verified": False,
             "why_relevant": _safe_text(item.get("why_relevant", "")).strip(),
             "relevance": min(1.0, max(0.0, float(item.get("relevance", 0.5)))),
         }

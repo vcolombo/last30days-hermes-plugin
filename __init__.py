@@ -321,6 +321,7 @@ def _items_from_citations(text: str) -> list[dict]:
             "author_handle": handle,
             "date": None,
             "engagement": None,
+            "engagement_verified": False,  # no authoritative counts, cited URL only
             "why_relevant": "citation-fallback",
             "relevance": 0.5,
         })

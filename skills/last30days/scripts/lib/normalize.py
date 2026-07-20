@@ -187,6 +187,7 @@ def _source_item(
     author: str | None = None,
     container: str | None = None,
     engagement: dict[str, float | int] | None = None,
+    engagement_verified: bool | None = None,
     snippet: str = "",
     metadata: dict[str, Any] | None = None,
 ) -> schema.SourceItem:
@@ -201,6 +202,7 @@ def _source_item(
         published_at=published_at,
         date_confidence=date_confidence,
         engagement=engagement or {},
+        engagement_verified=engagement_verified,
         relevance_hint=max(0.0, min(1.0, float(relevance_hint or 0.0))),
         why_relevant=why_relevant.strip(),
         snippet=snippet.strip(),
@@ -328,6 +330,9 @@ def _normalize_x(
         published_at=item.get("date"),
         date_confidence=_date_confidence(item, from_date, to_date),
         engagement=item.get("engagement") or {},
+        # False for model-reported engagement (xAI/injected); authoritative
+        # backends (bird/xquik) leave it unset (None = not flagged).
+        engagement_verified=item.get("engagement_verified"),
         relevance_hint=item.get("relevance", 0.5),
         why_relevant=str(item.get("why_relevant") or ""),
         metadata={"mentioned_handles": list(mentioned)} if mentioned else {},

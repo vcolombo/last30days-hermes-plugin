@@ -284,3 +284,38 @@ class RecencyVerifiedTests(unittest.TestCase):
             "date": "2026-01-01"}, source="jobs")
         self.assertEqual(1, len(out))
         self.assertIs(False, out[0].recency_verified)
+
+
+class EngagementVerifiedTests(unittest.TestCase):
+    """engagement_verified provenance: False = model-reported (xAI/injected)."""
+
+    def test_x_passes_through_model_reported_flag(self):
+        out = normalize.normalize_source_items(
+            "x",
+            [{"id": "x1", "text": "post", "url": "https://x.com/u/status/1",
+              "date": "2026-06-15", "engagement": {"likes": 5},
+              "engagement_verified": False}],
+            "2026-06-01", "2026-06-30")
+        self.assertEqual(1, len(out))
+        self.assertIs(False, out[0].engagement_verified)
+
+    def test_x_without_flag_is_none(self):
+        # Authoritative backends (bird/xquik) don't stamp it → None, not flagged.
+        out = normalize.normalize_source_items(
+            "x",
+            [{"id": "x1", "text": "post", "url": "https://x.com/u/status/1",
+              "date": "2026-06-15", "engagement": {"likes": 5}}],
+            "2026-06-01", "2026-06-30")
+        self.assertEqual(1, len(out))
+        self.assertIsNone(out[0].engagement_verified)
+
+
+class XaiEngagementProvenanceTests(unittest.TestCase):
+    def test_parse_x_response_marks_engagement_model_reported(self):
+        from lib import xai_x
+        items = xai_x.parse_x_response({"output": (
+            '{"items": [{"text": "t", "url": "https://x.com/u/status/9", '
+            '"author_handle": "u", "date": "2026-06-10", '
+            '"engagement": {"likes": 100}, "relevance": 0.8}]}')})
+        self.assertEqual(1, len(items))
+        self.assertIs(False, items[0]["engagement_verified"])
