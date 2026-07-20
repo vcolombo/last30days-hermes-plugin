@@ -91,6 +91,13 @@ class TestTwoPhaseBrowserCookiePolicy:
         pol = self._policy(l30, "topic")
         assert pol.browser_cookies == "read"
 
+    def test_empty_inject_path_is_still_plan_only(self):
+        # `--inject-results ""` is a malformed two-phase invocation, not a
+        # normal run — it must NOT drop back to read-cookies mode.
+        l30 = self._engine()
+        pol = self._policy(l30, "topic", "--inject-results", "")
+        assert pol.browser_cookies == "plan_only"
+
 
 X_ITEM = {
     "id": "X1", "text": "great post about test topic",
@@ -417,6 +424,18 @@ class TestInjectResults:
         )
         assert proc.returncode == 0, proc.stderr
         assert "x.com/someone/status/123456" in proc.stdout
+
+    def test_empty_inject_path_fails_locally_not_hosted(self, tmp_path):
+        """`--inject-results ""` with hosted API env set must fail locally
+        (exit 2, unreadable path) — never route the topic to the remote API."""
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic",
+             "--inject-results", "", "--search", "x", "--web-backend", "none"],
+            capture_output=True, text=True, timeout=120,
+            env=self._hosted_env(tmp_path),
+        )
+        assert proc.returncode == 2, proc.stderr
+        assert "inject-results" in proc.stderr.lower()
 
     def test_inject_miss_is_quiet_no_coverage(self, tmp_path):
         """A subquery not present in the inject map must not raise and must

@@ -1722,7 +1722,7 @@ def _config_policy_for_args(args: argparse.Namespace, topic: str, extra_argv: li
         args.diagnose or args.preflight or normalized_topic == "doctor"
         or is_library_command or is_cached_verification
         or getattr(args, "plan_queries", False)
-        or getattr(args, "inject_results", None)
+        or getattr(args, "inject_results", None) is not None
     ):
         # doctor is plan-only like --diagnose: it must never read cookies.
         # Cache-only freshness verification hits only point APIs (Polymarket,
@@ -2211,8 +2211,10 @@ def _main(
         and not args.mock
         and not args.record_fixtures
         # Two-phase host modes are agent-local and never route to the hosted backend.
+        # `is None` (not truthiness) so `--inject-results ""` still counts as
+        # two-phase mode and is rejected locally, never routed remotely.
         and not args.plan_queries
-        and not args.inject_results
+        and args.inject_results is None
         and env.read_secret_env("LAST30DAYS_API_KEY")
         and os.environ.get("LAST30DAYS_API_BASE")
         and not resolved_corpus_dirs
@@ -2355,7 +2357,10 @@ def _main(
                 # --plan file-read branch above and parse_competitors_plan.
                 raise SystemExit(2)
 
-        if args.inject_results:
+        if args.inject_results is not None:
+            # `is not None` (not truthiness): an empty --inject-results path is a
+            # malformed two-phase invocation; fail loudly here rather than
+            # silently running a normal (un-injected) pass.
             import json as _json2
             try:
                 with open(args.inject_results, encoding="utf-8") as f:

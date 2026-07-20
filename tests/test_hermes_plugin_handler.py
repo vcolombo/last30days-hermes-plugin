@@ -369,6 +369,25 @@ class TestDispatchPool:
         # The stranded thread still holds the only slot.
         assert sema.acquire(blocking=False) is False
 
+    def test_thread_start_failure_releases_slot(self, monkeypatch):
+        """If Thread.start() raises, the worker's finally never runs — the
+        slot must be released here, else transient start failures permanently
+        drain the pool."""
+        import threading
+        plugin = _load_plugin()
+        sema = threading.BoundedSemaphore(1)
+        monkeypatch.setattr(plugin, "_dispatch_slots", sema)
+
+        class BoomThread(threading.Thread):
+            def start(self):
+                raise RuntimeError("cannot start thread")
+
+        monkeypatch.setattr(plugin.threading, "Thread", BoomThread)
+        with pytest.raises(RuntimeError, match="cannot start thread"):
+            plugin._dispatch(FakeCtx(), "x_search", {})
+        # Slot returned despite the start failure — pool not drained.
+        assert sema.acquire(blocking=False) is True
+
 
 class TestCitationFallback:
     def test_only_status_urls_accepted(self):
