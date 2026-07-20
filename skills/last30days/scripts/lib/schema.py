@@ -85,6 +85,11 @@ class SourceItem:
     container: str | None = None
     published_at: str | None = None
     date_confidence: Literal["high", "med", "low"] = "low"
+    # Provenance: True iff this item carries a real publication date inside the
+    # requested window. None = not assessed (item never went through
+    # normalize). Dateless evidence (e.g. injected web from Hermes web_search)
+    # is False — usable for corroboration but NOT provable "last N days".
+    recency_verified: bool | None = None
     engagement: dict[str, float | int] = field(default_factory=dict)
     relevance_hint: float = 0.5
     why_relevant: str = ""
@@ -430,6 +435,7 @@ def source_item_from_dict(payload: dict[str, Any]) -> SourceItem:
         container=payload.get("container"),
         published_at=payload.get("published_at"),
         date_confidence=payload.get("date_confidence") or "low",
+        recency_verified=payload.get("recency_verified"),
         engagement=dict(payload.get("engagement") or {}),
         relevance_hint=float(_first_non_none(payload.get("relevance_hint"), 0.5)),
         why_relevant=payload.get("why_relevant") or "",

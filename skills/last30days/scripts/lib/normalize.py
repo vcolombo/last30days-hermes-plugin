@@ -75,6 +75,15 @@ def normalize_source_items(
     if normalizer is None:
         raise ValueError(f"Unsupported source: {source}")
     normalized = [normalizer(source, item, index, from_date, to_date) for index, item in enumerate(items)]
+    # Recency provenance: an item is verified only if it carries a real
+    # publication date inside the window. Dateless evidence (e.g. injected web
+    # from Hermes web_search, or open job postings) is corroborating, not
+    # date-provable, and must not be described as "last N days" evidence.
+    for entry in normalized:
+        entry.recency_verified = bool(entry.published_at) and (
+            dates.get_date_confidence(entry.published_at, from_date, to_date)
+            == "high"
+        )
     if source == "jobs":
         # A careers board is a snapshot of CURRENTLY OPEN roles. An open posting
         # is current evidence regardless of when it was posted, so date-windowing
