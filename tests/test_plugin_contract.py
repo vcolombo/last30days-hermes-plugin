@@ -1,4 +1,5 @@
 import json
+import re
 import tomllib
 import unittest
 from pathlib import Path
@@ -86,6 +87,19 @@ class TestPluginContract(unittest.TestCase):
         grok_plugins = grok_marketplace.get("plugins") or []
         self.assertEqual(1, len(grok_plugins))
         self.assertEqual(version, grok_plugins[0]["version"])
+
+    def test_hermes_plugin_yaml_version_matches(self) -> None:
+        # No yaml dependency in this repo: parse the two fields with regexes.
+        text = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
+        name = re.search(r'^name:\s*"?([\w-]+)"?\s*$', text, re.MULTILINE)
+        version = re.search(r'^version:\s*"?([\d.]+)"?\s*$', text, re.MULTILINE)
+        self.assertIsNotNone(name, "plugin.yaml missing name")
+        self.assertIsNotNone(version, "plugin.yaml missing version")
+        self.assertEqual("last30days", name.group(1))
+
+        pyproject = tomllib.loads(
+            (ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(pyproject["project"]["version"], version.group(1))
 
     def test_claude_marketplace_has_current_schema_shape(self) -> None:
         marketplace = _json(ROOT / ".claude-plugin" / "marketplace.json")
