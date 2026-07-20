@@ -20,8 +20,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -177,12 +177,13 @@ def _fetch_all(ctx, payload: dict, depth: str):
             per_query.append({**q, "status": "skipped-deadline", "items": 0})
             warnings.append(f"dispatch deadline hit before {qid}")
             continue
+        remaining = deadline - time.monotonic()
         try:
             if source == "x":
-                items = _fetch_x(ctx, query, payload, depth)
+                items = _fetch_x(ctx, query, payload, depth, remaining)
                 inject["x"][query] = items
             else:
-                items = _fetch_web(ctx, query, payload)
+                items = _fetch_web(ctx, query, payload, remaining)
                 inject["web"][query] = items
             # An empty list is still injected: a real zero-result hit.
             per_query.append(
@@ -202,32 +203,40 @@ def _fetch_all(ctx, payload: dict, depth: str):
 
 
 def _dispatch(ctx, name: str, args: dict, timeout_s: float | None = None) -> str:
-    """dispatch_tool with a hard timeout.
+    """dispatch_tool with a hard wait-timeout on a daemon thread.
 
-    ctx.dispatch_tool is synchronous; a stalled backend would otherwise hang
-    the Hermes worker past every budget. On timeout the worker thread may
-    linger until the call returns, but this handler regains control and
-    reports the query as failed.
+    ctx.dispatch_tool is synchronous with no cancellation API, so a stalled
+    backend cannot be interrupted — but the daemon worker never blocks
+    interpreter/worker shutdown, and this handler regains control at the
+    timeout and reports the query failed. Serial dispatch bounds lingering
+    threads to at most one hung call per run.
     """
     if timeout_s is None:
         timeout_s = DISPATCH_CALL_TIMEOUT_S
-    executor = ThreadPoolExecutor(max_workers=1)
-    try:
-        future = executor.submit(ctx.dispatch_tool, name, args)
+    box: dict = {}
+
+    def _run():
         try:
-            return future.result(timeout=timeout_s)
-        except FutureTimeout:
-            raise RuntimeError(
-                f"{name} dispatch timed out after {timeout_s:.0f}s")
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+            box["result"] = ctx.dispatch_tool(name, args)
+        except Exception as exc:  # noqa: BLE001 — propagated to caller below
+            box["error"] = exc
+
+    t = threading.Thread(target=_run, name=f"last30days-{name}", daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise RuntimeError(f"{name} dispatch timed out after {timeout_s:.0f}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("result", "")
 
 
 # ---------------------------------------------------------------------------
 # X adapter
 # ---------------------------------------------------------------------------
 
-def _fetch_x(ctx, query: str, payload: dict, depth: str) -> list[dict]:
+def _fetch_x(ctx, query: str, payload: dict, depth: str,
+             timeout_s: float) -> list[dict]:
     xai = _engine_lib("xai_x")
     min_items, max_items = xai.DEPTH_CONFIG.get(depth, xai.DEPTH_CONFIG["default"])
     prompt = xai.X_SEARCH_PROMPT.format(
@@ -241,7 +250,7 @@ def _fetch_x(ctx, query: str, payload: dict, depth: str) -> list[dict]:
         "query": prompt,
         "from_date": payload.get("from_date"),
         "to_date": payload.get("to_date"),
-    })
+    }, timeout_s=min(DISPATCH_CALL_TIMEOUT_S, timeout_s))
     data = raw
     if isinstance(raw, str):
         try:
@@ -286,9 +295,11 @@ def _items_from_citations(text: str) -> list[dict]:
 # Web adapter
 # ---------------------------------------------------------------------------
 
-def _fetch_web(ctx, query: str, payload: dict) -> list[dict]:
-    raw = _dispatch(ctx, "web_search", {"query": query,
-                                        "limit": WEB_RESULT_LIMIT})
+def _fetch_web(ctx, query: str, payload: dict,
+               timeout_s: float) -> list[dict]:
+    raw = _dispatch(ctx, "web_search",
+                    {"query": query, "limit": WEB_RESULT_LIMIT},
+                    timeout_s=min(DISPATCH_CALL_TIMEOUT_S, timeout_s))
     results = _web_results(raw)
     items = []
     for i, r in enumerate(results):
@@ -319,13 +330,22 @@ def _fetch_web(ctx, query: str, payload: dict) -> list[dict]:
 
 
 def _web_results(raw) -> list:
-    """Hermes returns the handler's JSON string; accept the common shapes."""
+    """Parse a web_search return into its result list.
+
+    Raises RuntimeError on a malformed/unrecognized non-empty return so the
+    caller records a failed query (not a silent zero-result injection that
+    would suppress engine fallback). An explicit empty result shape returns [].
+    """
     data = raw
     if isinstance(raw, str):
+        text = _unwrap(raw)
+        if not text.strip():
+            return []  # genuinely empty return
         try:
-            data = json.loads(_unwrap(raw))
-        except json.JSONDecodeError:
-            return []
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"web_search returned non-JSON output: {text[:120]}") from exc
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -339,7 +359,10 @@ def _web_results(raw) -> list:
         for key in ("results", "items", "data"):
             if isinstance(data.get(key), list):
                 return data[key]
-    return []
+        raise RuntimeError(
+            f"web_search returned unrecognized shape: {sorted(data)[:8]}")
+    raise RuntimeError(
+        f"web_search returned unsupported type: {type(data).__name__}")
 
 
 # ---------------------------------------------------------------------------

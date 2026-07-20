@@ -179,7 +179,7 @@ class TestHandler:
         assert by_id["w1"]["status"] == "injected"
         assert by_id["w1"]["items"] == 2
         items = plugin._fetch_web(FakeCtx(web_return=WEB_WRAPPED_FIXTURE),
-                                  "q", {})
+                                  "q", {}, 10.0)
         assert items[0]["snippet"] == "Hermes Agent, memory, and the ecosystem..."
 
     def test_hung_dispatch_times_out_and_marks_query_failed(self, monkeypatch):
@@ -205,6 +205,60 @@ class TestHandler:
         assert statuses["x1"] == "failed"
         assert any("timed out" in w for w in result["warnings"])
 
+    def test_hung_dispatch_worker_thread_is_daemon(self, monkeypatch):
+        """The lingering worker for a timed-out dispatch must be a daemon so a
+        truly-hung backend can never block interpreter/worker shutdown."""
+        import threading
+
+        class SlowCtx(FakeCtx):
+            def dispatch_tool(self, name, args, **kwargs):
+                if name == "x_search":
+                    time.sleep(5)
+                return super().dispatch_tool(name, args, **kwargs)
+
+        plugin = _load_plugin()
+        monkeypatch.setattr(plugin, "DISPATCH_CALL_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(plugin.subprocess, "run", _fake_run_factory())
+        ctx = SlowCtx()
+        plugin.register(ctx)
+        handler = ctx.registered_tools["last30days_research"]
+        t0 = time.monotonic()
+        result = json.loads(handler({"topic": "test topic"}))
+        assert time.monotonic() - t0 < 5  # returned before the hung sleep
+        assert result["ok"] is True
+        lingering = [t for t in threading.enumerate()
+                     if t.name.startswith("last30days-")]
+        assert lingering, "expected the hung dispatch worker to still exist"
+        assert all(t.daemon for t in lingering)
+
+    def test_deadline_clamps_call_timeout_and_skips_later_queries(
+            self, monkeypatch):
+        """Remaining deadline budget bounds each dispatch, so one slow call at
+        the end of the budget cannot add a full DISPATCH_CALL_TIMEOUT_S."""
+        class SlowWebCtx(FakeCtx):
+            def dispatch_tool(self, name, args, **kwargs):
+                time.sleep(2)
+                return super().dispatch_tool(name, args, **kwargs)
+
+        plugin = _load_plugin()
+        monkeypatch.setattr(plugin, "DISPATCH_DEADLINE_S", 0.5)
+        monkeypatch.setattr(plugin, "DISPATCH_CALL_TIMEOUT_S", 60)
+        monkeypatch.setattr(plugin.subprocess, "run", _fake_run_factory())
+        ctx = SlowWebCtx()
+        plugin.register(ctx)
+        handler = ctx.registered_tools["last30days_research"]
+        t0 = time.monotonic()
+        result = json.loads(handler({"topic": "test topic"}))
+        elapsed = time.monotonic() - t0
+        # First query gets <=0.5s (clamped to remaining), second is skipped:
+        # nowhere near the 60s per-call timeout.
+        assert elapsed < 5
+        assert result["ok"] is True
+        statuses = {q["id"]: q["status"] for q in result["coverage"]["queries"]}
+        assert statuses["x1"] == "failed"  # timed out at the clamped budget
+        assert statuses["w1"] == "skipped-deadline"
+        assert "w1" in result["coverage"]["no_coverage"]
+
     def test_non_dict_args_return_error_envelope_not_raise(self, monkeypatch):
         """None/list args must yield a JSON ok:false envelope, never an
         exception into the registry."""
@@ -224,6 +278,30 @@ class TestHandler:
         assert result["ok"] is True
         statuses = {q["id"]: q["status"] for q in result["coverage"]["queries"]}
         assert statuses["w1"] == "failed"
+
+    def test_web_results_malformed_raises_not_empty(self):
+        """Malformed != empty: non-JSON or unrecognized shapes must raise so
+        the query is recorded failed, not silently injected as zero results."""
+        plugin = _load_plugin()
+        with pytest.raises(RuntimeError):
+            plugin._web_results("not json at all")
+        with pytest.raises(RuntimeError):
+            plugin._web_results('{"weird": "shape"}')
+        # Recognized-empty shapes still return [] (a real zero-result hit).
+        assert plugin._web_results('{"results": []}') == []
+        assert plugin._web_results("[]") == []
+        assert plugin._web_results("   ") == []
+
+    def test_malformed_web_return_marks_query_failed_not_injected(
+            self, monkeypatch):
+        """A truncated/non-JSON web_search return must record the query as
+        failed (engine sees no_coverage), never a zero-result injection."""
+        ctx = FakeCtx(web_return="<html>502 Bad Gateway</html>")
+        result = self._invoke(monkeypatch, ctx)
+        assert result["ok"] is True
+        statuses = {q["id"]: q["status"] for q in result["coverage"]["queries"]}
+        assert statuses["w1"] == "failed"
+        assert "w1" in result["coverage"]["no_coverage"]
 
 
 class TestCitationFallback:

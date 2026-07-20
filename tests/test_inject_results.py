@@ -250,6 +250,37 @@ class TestInjectResults:
         assert not marker.exists(), "inject mode executed xurl (live probe)"
         assert "x.com/someone/status/123456" in proc.stdout
 
+    def test_plan_queries_mode_never_spawns_xurl(self, tmp_path):
+        """Phase 1 (--plan-queries) never fetches X — the plugin fetches via
+        Hermes — so it must not probe X backends live either. Same fake-xurl
+        shim guarantee as the inject-mode test, but for the plan phase and
+        WITHOUT --mock so real availability/backend resolution runs."""
+        import os
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        marker = tmp_path / "xurl-invoked"
+        shim = bin_dir / "xurl"
+        shim.write_text(
+            f"#!/bin/sh\ntouch {marker}\n"
+            'echo \'{"data":{"username":"fake"}}\'\nexit 0\n',
+            encoding="utf-8")
+        shim.chmod(0o755)
+
+        out = tmp_path / "plan.json"
+        env = {"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+               "HOME": str(tmp_path),  # no user config, no keys, no token store
+               "LAST30DAYS_CONFIG_DIR": ""}
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic", "--plan-queries",
+             "--plan-queries-out", str(out),
+             "--search", "x", "--web-backend", "none"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert not marker.exists(), "plan-queries mode executed xurl (live probe)"
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        assert payload["queries"]
+
     def test_inject_miss_is_quiet_no_coverage(self, tmp_path):
         """A subquery not present in the inject map must not raise and must
         not fall through to live backends (injected-only policy)."""

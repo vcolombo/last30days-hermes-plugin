@@ -1310,13 +1310,20 @@ def run(
         if not requested_sources and not hiring_signals_mode and not _company_topic_likely(topic):
             available = [source for source in available if source != "jobs"]
     else:
+        if plan_queries_only:
+            # Plan-only mode never fetches X; keep backend resolution and
+            # availability probing network-free (xurl availability is a live
+            # authenticated `xurl whoami`). Mirror the inject-mode guard.
+            config = {**config, "_plan_queries_only": True}
         runtime, reasoning_provider = providers.resolve_runtime(config, depth)
         available = available_sources(
             config,
             requested_sources,
-            # Injected-only mode must not probe X backends over the network
-            # (xurl's availability check is a live authenticated `xurl whoami`).
-            local_only=config.get("_inject_results") is not None,
+            # Injected-only and plan-only modes must not probe X backends over
+            # the network (xurl's availability check is a live authenticated
+            # `xurl whoami`).
+            local_only=(config.get("_inject_results") is not None
+                        or config.get("_plan_queries_only") is True),
         )
         if requested_sources:
             available = [source for source in available if source in requested_sources]
