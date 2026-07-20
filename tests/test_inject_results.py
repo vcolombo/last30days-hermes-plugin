@@ -339,6 +339,30 @@ class TestInjectResults:
         assert not marker.exists(), "inject mode executed xurl (live probe)"
         assert "x.com/someone/status/123456" in proc.stdout
 
+    def test_empty_inject_path_never_spawns_xurl(self, tmp_path):
+        """`--inject-results ""` is two-phase mode: the pre-run diagnose must
+        stay network-free (no live `xurl whoami`) even though the empty path
+        then fails at the load guard."""
+        import os
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        marker = tmp_path / "xurl-invoked"
+        shim = bin_dir / "xurl"
+        shim.write_text(
+            f"#!/bin/sh\ntouch {marker}\n"
+            'echo \'{"data":{"username":"fake"}}\'\nexit 0\n',
+            encoding="utf-8")
+        shim.chmod(0o755)
+        env = {"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+               "HOME": str(tmp_path), "LAST30DAYS_CONFIG_DIR": ""}
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic",
+             "--inject-results", "", "--search", "x", "--web-backend", "none"],
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+        assert proc.returncode == 2, proc.stderr  # empty path fails loudly
+        assert not marker.exists(), "empty inject path probed xurl live"
+
     def test_plan_queries_mode_never_spawns_xurl(self, tmp_path):
         """Phase 1 (--plan-queries) never fetches X — the plugin fetches via
         Hermes — so it must not probe X backends live either. Same fake-xurl

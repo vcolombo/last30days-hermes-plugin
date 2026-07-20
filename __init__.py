@@ -241,10 +241,13 @@ def _dispatch(ctx, name: str, args: dict, timeout_s: float | None = None) -> str
     t = threading.Thread(target=_run, name=f"last30days-{name}", daemon=True)
     try:
         t.start()
-    except BaseException:
-        # The worker never ran, so its finally won't release. Return the slot
-        # we acquired, else a transient thread-start failure permanently
-        # drains the pool.
+    except Exception:
+        # Ordinary start failure (e.g. "can't start new thread") means the
+        # worker never ran, so its finally won't release — return the slot we
+        # acquired, else a transient failure permanently drains the pool.
+        # NOT BaseException: a KeyboardInterrupt during start()'s post-spawn
+        # wait can arrive after the worker began, and it will release via its
+        # own finally — double-releasing here would over-release the semaphore.
         slots.release()
         raise
     t.join(timeout_s)
