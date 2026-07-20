@@ -60,6 +60,38 @@ class TestPlanQueries:
         assert emitted <= round_tripped
 
 
+class TestTwoPhaseBrowserCookiePolicy:
+    """Two-phase host modes must use plan-only cookie policy (never read the
+    AUTH_TOKEN/CT0 X credential from browser cookies — X comes via Hermes)."""
+
+    def _engine(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import last30days
+        finally:
+            sys.path.remove(str(SCRIPTS))
+        return last30days
+
+    def _policy(self, l30, *argv):
+        args, _ = l30.build_parser().parse_known_args(argv)
+        return l30._config_policy_for_args(args, "topic", [])
+
+    def test_plan_queries_is_plan_only(self):
+        l30 = self._engine()
+        pol = self._policy(l30, "topic", "--plan-queries")
+        assert pol.browser_cookies == "plan_only"
+
+    def test_inject_results_is_plan_only(self, tmp_path):
+        l30 = self._engine()
+        pol = self._policy(l30, "topic", "--inject-results", str(tmp_path / "i.json"))
+        assert pol.browser_cookies == "plan_only"
+
+    def test_normal_run_still_reads(self):
+        l30 = self._engine()
+        pol = self._policy(l30, "topic")
+        assert pol.browser_cookies == "read"
+
+
 X_ITEM = {
     "id": "X1", "text": "great post about test topic",
     "url": "https://x.com/someone/status/123456", "author_handle": "someone",
@@ -330,6 +362,61 @@ class TestInjectResults:
         assert not marker.exists(), "plan-queries mode executed xurl (live probe)"
         payload = json.loads(out.read_text(encoding="utf-8"))
         assert payload["queries"]
+
+    def _hosted_env(self, tmp_path):
+        import os
+        return {"PATH": os.environ.get("PATH", ""),
+                "HOME": str(tmp_path),
+                "LAST30DAYS_CONFIG_DIR": "",  # ignore user config
+                "LAST30DAYS_API_KEY": "dummy",
+                "LAST30DAYS_API_BASE": "https://example.invalid"}
+
+    def test_plan_queries_ignores_hosted_backend(self, tmp_path):
+        """Two-phase plan phase must stay agent-local even when hosted API env
+        is set — otherwise it would egress the topic to the remote service and
+        never write the plan file."""
+        out = tmp_path / "plan.json"
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic", "--plan-queries",
+             "--plan-queries-out", str(out),
+             "--search", "x", "--web-backend", "none"],
+            capture_output=True, text=True, timeout=120,
+            env=self._hosted_env(tmp_path),
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert out.exists(), "hosted routing fired: no plan file written"
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        assert payload["queries"]
+
+    def test_inject_run_ignores_hosted_backend(self, tmp_path):
+        """Two-phase inject phase must inject locally, not route to the hosted
+        API, when LAST30DAYS_API_* are set."""
+        env = self._hosted_env(tmp_path)
+        out = tmp_path / "plan.json"
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic", "--plan-queries",
+             "--plan-queries-out", str(out),
+             "--search", "x", "--web-backend", "none"],
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        inject = {"x": {}, "web": {}}
+        for q in payload["queries"]:
+            if q["source"] == "x":
+                inject["x"][q["search_query"]] = [X_ITEM]
+        inject_file = tmp_path / "inject.json"
+        inject_file.write_text(json.dumps(inject), encoding="utf-8")
+        plan_file = tmp_path / "plan-only.json"
+        plan_file.write_text(json.dumps(payload["plan"]), encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic",
+             "--plan", str(plan_file), "--inject-results", str(inject_file),
+             "--search", "x", "--web-backend", "none", "--emit", "compact"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "x.com/someone/status/123456" in proc.stdout
 
     def test_inject_miss_is_quiet_no_coverage(self, tmp_path):
         """A subquery not present in the inject map must not raise and must

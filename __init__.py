@@ -39,6 +39,13 @@ STDERR_TAIL_CHARS = 2000
 _STATUS_URL_RE = re.compile(
     r"https?://(?:x|twitter)\.com/[A-Za-z0-9_]{1,15}/status/(\d+)")
 
+# Process-wide cap on concurrent/stranded dispatch threads. A timed-out dispatch
+# abandons a daemon thread that keeps holding its slot (Hermes has no cancel
+# API); once _MAX_INFLIGHT_DISPATCH threads hang, new dispatches fail fast until
+# the gateway restarts, instead of accumulating unbounded across runs.
+_MAX_INFLIGHT_DISPATCH = 8
+_dispatch_slots = threading.BoundedSemaphore(_MAX_INFLIGHT_DISPATCH)
+
 TOOL_SCHEMA = {
     "name": "last30days_research",
     "description": (
@@ -215,11 +222,21 @@ def _dispatch(ctx, name: str, args: dict, timeout_s: float | None = None) -> str
         timeout_s = DISPATCH_CALL_TIMEOUT_S
     box: dict = {}
 
+    # Acquire a slot before starting the thread. A hung thread keeps its slot
+    # forever (released only in _run's finally, never on timeout), so a
+    # persistently-stalled backend fails fast once the pool is drained. Bind the
+    # semaphore locally so acquire/release are symmetric on the same object.
+    slots = _dispatch_slots
+    if not slots.acquire(blocking=False):
+        raise RuntimeError("dispatch pool exhausted — too many stalled tool calls")
+
     def _run():
         try:
             box["result"] = ctx.dispatch_tool(name, args)
         except Exception as exc:  # noqa: BLE001 — propagated to caller below
             box["error"] = exc
+        finally:
+            slots.release()
 
     t = threading.Thread(target=_run, name=f"last30days-{name}", daemon=True)
     t.start()
@@ -266,7 +283,16 @@ def _fetch_x(ctx, query: str, payload: dict, depth: str,
         return xai.parse_x_response({"output": text})
     except Exception:
         # Fallback: mine validated x.com/twitter.com status citations only.
-        return _items_from_citations(text)
+        cited = _items_from_citations(text)
+        if not cited and isinstance(data, dict):
+            # Structured non-error dict with no items and no citations is not a
+            # genuine empty result — fail so it surfaces as no_coverage rather
+            # than a silent zero-result injection. (Plain-text returns leave
+            # data=None and fall through to the normal empty-citations path.)
+            raise RuntimeError(
+                "x_search returned unrecognized structured response "
+                "with no items or citations")
+        return cited
 
 
 def _items_from_citations(text: str) -> list[dict]:
