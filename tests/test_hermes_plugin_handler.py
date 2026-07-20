@@ -4,6 +4,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -180,6 +181,41 @@ class TestHandler:
         items = plugin._fetch_web(FakeCtx(web_return=WEB_WRAPPED_FIXTURE),
                                   "q", {})
         assert items[0]["snippet"] == "Hermes Agent, memory, and the ecosystem..."
+
+    def test_hung_dispatch_times_out_and_marks_query_failed(self, monkeypatch):
+        """A stalled dispatch_tool must not hang the worker: _dispatch bounds
+        each call, the query is marked failed, and the run continues."""
+        class SlowCtx(FakeCtx):
+            def dispatch_tool(self, name, args, **kwargs):
+                if name == "x_search":
+                    time.sleep(3)
+                return super().dispatch_tool(name, args, **kwargs)
+
+        plugin = _load_plugin()
+        monkeypatch.setattr(plugin, "DISPATCH_CALL_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(plugin.subprocess, "run", _fake_run_factory())
+        ctx = SlowCtx()
+        plugin.register(ctx)
+        handler = ctx.registered_tools["last30days_research"]
+        t0 = time.monotonic()
+        result = json.loads(handler({"topic": "test topic"}))
+        assert time.monotonic() - t0 < 3  # regained control before the sleep
+        assert result["ok"] is True
+        statuses = {q["id"]: q["status"] for q in result["coverage"]["queries"]}
+        assert statuses["x1"] == "failed"
+        assert any("timed out" in w for w in result["warnings"])
+
+    def test_non_dict_args_return_error_envelope_not_raise(self, monkeypatch):
+        """None/list args must yield a JSON ok:false envelope, never an
+        exception into the registry."""
+        plugin = _load_plugin()
+        ctx = FakeCtx()
+        plugin.register(ctx)
+        handler = ctx.registered_tools["last30days_research"]
+        for bad in (None, [1]):
+            result = json.loads(handler(bad))
+            assert result["ok"] is False
+            assert "arguments" in result["error"]
 
     def test_web_search_error_marks_query_failed(self, monkeypatch):
         ctx = FakeCtx(web_return=json.dumps(

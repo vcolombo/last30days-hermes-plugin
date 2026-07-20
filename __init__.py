@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -30,6 +31,7 @@ SKILL_MD = ROOT / "skills" / "last30days" / "SKILL.md"
 PLAN_TIMEOUT_S = 180
 RESEARCH_TIMEOUT_S = 900
 DISPATCH_DEADLINE_S = 300   # total wall clock for all dispatch_tool calls
+DISPATCH_CALL_TIMEOUT_S = 120  # per-dispatch bound; a hung tool must not block the worker
 MAX_WEB_QUERIES = 6
 WEB_RESULT_LIMIT = 10
 STDERR_TAIL_CHARS = 2000
@@ -75,28 +77,30 @@ def register(ctx):
 # Handler
 # ---------------------------------------------------------------------------
 
-def _handler(ctx, args: dict) -> str:
-    topic = str(args.get("topic") or "").strip()
-    if not topic:
-        return _error("plan", "missing required argument: topic")
-    depth = args.get("depth") or "default"
-    emit = args.get("emit") or "context"
-    lookback = args.get("lookback_days")
-
-    shared_flags: list[str] = []
-    if depth == "quick":
-        shared_flags.append("--quick")
-    elif depth == "deep":
-        shared_flags.append("--deep")
-    if lookback:
-        try:
-            shared_flags += ["--days", str(int(lookback))]
-        except (TypeError, ValueError):
-            return _error("plan", f"invalid lookback_days: {lookback!r}")
-
+def _handler(ctx, args) -> str:
     tmpdir: Path | None = None
     timings: dict[str, float] = {}
     try:
+        if not isinstance(args, dict):
+            return _error("plan", "arguments must be an object")
+        topic = str(args.get("topic") or "").strip()
+        if not topic:
+            return _error("plan", "missing required argument: topic")
+        depth = args.get("depth") or "default"
+        emit = args.get("emit") or "context"
+        lookback = args.get("lookback_days")
+
+        shared_flags: list[str] = []
+        if depth == "quick":
+            shared_flags.append("--quick")
+        elif depth == "deep":
+            shared_flags.append("--deep")
+        if lookback:
+            try:
+                shared_flags += ["--days", str(int(lookback))]
+            except (TypeError, ValueError):
+                return _error("plan", f"invalid lookback_days: {lookback!r}")
+
         tmpdir = Path(tempfile.mkdtemp(prefix="last30days-hermes-"))
         # Phase 1: plan
         t0 = time.monotonic()
@@ -197,6 +201,28 @@ def _fetch_all(ctx, payload: dict, depth: str):
     return inject, coverage, warnings
 
 
+def _dispatch(ctx, name: str, args: dict, timeout_s: float | None = None) -> str:
+    """dispatch_tool with a hard timeout.
+
+    ctx.dispatch_tool is synchronous; a stalled backend would otherwise hang
+    the Hermes worker past every budget. On timeout the worker thread may
+    linger until the call returns, but this handler regains control and
+    reports the query as failed.
+    """
+    if timeout_s is None:
+        timeout_s = DISPATCH_CALL_TIMEOUT_S
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(ctx.dispatch_tool, name, args)
+        try:
+            return future.result(timeout=timeout_s)
+        except FutureTimeout:
+            raise RuntimeError(
+                f"{name} dispatch timed out after {timeout_s:.0f}s")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 # ---------------------------------------------------------------------------
 # X adapter
 # ---------------------------------------------------------------------------
@@ -211,7 +237,7 @@ def _fetch_x(ctx, query: str, payload: dict, depth: str) -> list[dict]:
         min_items=min_items,
         max_items=max_items,
     )
-    raw = ctx.dispatch_tool("x_search", {
+    raw = _dispatch(ctx, "x_search", {
         "query": prompt,
         "from_date": payload.get("from_date"),
         "to_date": payload.get("to_date"),
@@ -261,8 +287,8 @@ def _items_from_citations(text: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _fetch_web(ctx, query: str, payload: dict) -> list[dict]:
-    raw = ctx.dispatch_tool("web_search", {"query": query,
-                                           "limit": WEB_RESULT_LIMIT})
+    raw = _dispatch(ctx, "web_search", {"query": query,
+                                        "limit": WEB_RESULT_LIMIT})
     results = _web_results(raw)
     items = []
     for i, r in enumerate(results):

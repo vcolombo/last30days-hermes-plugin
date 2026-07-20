@@ -318,7 +318,10 @@ def _resolve_x_backend(config: dict[str, Any]) -> str | None:
     preferred = (config.get(env.X_BACKEND_PIN_VAR) or "").lower()
     if preferred in {"xai", "bird"}:
         return preferred
-    return env.get_x_source(config)
+    # Injected-only mode (Hermes plugin) must resolve from local evidence
+    # only — xurl's live leg spawns an authenticated `xurl whoami`.
+    return env.get_x_source(
+        config, local_only=bool(config.get("_inject_results")))
 
 
 def _require_gemini_31(model: str, *, role: str) -> None:

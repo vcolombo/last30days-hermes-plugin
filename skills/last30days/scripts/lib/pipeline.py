@@ -200,7 +200,7 @@ def available_sources(
         # diagnose() precomputes the predicate and passes it via x_pending to
         # avoid evaluating it twice in one diagnose() call.
         if x_pending is None:
-            x_pending = env.x_pending_browser_auth(config)
+            x_pending = env.x_pending_browser_auth(config, local_only=local_only)
         if x_pending:
             available.append("x")
     if which("yt-dlp") or env.is_youtube_sc_available(config):
@@ -1311,7 +1311,13 @@ def run(
             available = [source for source in available if source != "jobs"]
     else:
         runtime, reasoning_provider = providers.resolve_runtime(config, depth)
-        available = available_sources(config, requested_sources)
+        available = available_sources(
+            config,
+            requested_sources,
+            # Injected-only mode must not probe X backends over the network
+            # (xurl's availability check is a live authenticated `xurl whoami`).
+            local_only=config.get("_inject_results") is not None,
+        )
         if requested_sources:
             available = [source for source in available if source in requested_sources]
     # Keep an explicitly requested but unconfigured corpus in the plan long
@@ -2480,6 +2486,11 @@ def _run_supplemental_searches(
 ) -> None:
     """Phase 2: extract entities from Phase 1 results, run targeted supplemental searches."""
     if depth == "quick" or mock:
+        return
+
+    if config.get("_inject_results") is not None:
+        # Injected-only mode (Hermes plugin): supplemental X lanes are live
+        # credentialed fetches with no injection seam — skip them entirely.
         return
 
     from_date, to_date = date_range

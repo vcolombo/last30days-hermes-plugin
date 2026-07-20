@@ -2243,7 +2243,11 @@ def _main(
         return hosted.run_hosted(topic, depth, **hosted_kwargs)
 
     requested_sources = resolve_requested_sources(args.search, config)
-    diag = pipeline.diagnose(config, requested_sources, safe=args.diagnose)
+    # Injected-only mode (--inject-results) must keep this pre-run diagnose
+    # network-free: probe mode spawns a live `xurl whoami` and a bird probe.
+    diag = pipeline.diagnose(
+        config, requested_sources,
+        safe=args.diagnose or bool(args.inject_results))
 
     if args.diagnose:
         print(json.dumps(diag, indent=2, sort_keys=True))

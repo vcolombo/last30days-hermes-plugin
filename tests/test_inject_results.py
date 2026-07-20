@@ -153,6 +153,103 @@ class TestInjectResults:
         assert proc.returncode == 0, proc.stderr
         assert "x.com/someone/status/123456" in proc.stdout
 
+    def test_phase2_supplemental_skipped_in_inject_mode(self, monkeypatch):
+        """Injected-only mode must skip Phase 2 supplemental X lanes entirely:
+        they are live credentialed fetches with no injection seam. Without the
+        guard, x_handle drives entity extraction and the handle/mention lanes."""
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            from lib import pipeline, schema
+        finally:
+            sys.path.remove(str(SCRIPTS))
+        import threading
+
+        def boom(*args, **kwargs):
+            raise AssertionError("entity extraction must not run in inject mode")
+
+        monkeypatch.setattr(pipeline.entity_extract, "extract_entities", boom)
+        plan = schema.QueryPlan(
+            intent="general",
+            freshness_mode="balanced_recent",
+            cluster_mode="story",
+            raw_topic="test topic",
+            subqueries=[],
+            source_weights={},
+        )
+        result = pipeline._run_supplemental_searches(
+            topic="test topic",
+            bundle=schema.RetrievalBundle(),
+            plan=plan,
+            config={"_inject_results": {"x": {}, "web": {}}},
+            depth="default",
+            date_range=("2026-06-20", "2026-07-20"),
+            runtime=None,  # guard returns before runtime is touched
+            mock=False,
+            rate_limited_sources=set(),
+            rate_limit_lock=threading.Lock(),
+            x_handle="someone",
+        )
+        assert result is None
+
+    def test_resolve_x_backend_is_local_only_in_inject_mode(self, monkeypatch):
+        """providers._resolve_x_backend must not run xurl's live `whoami`
+        probe when the engine is in injected-only mode."""
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            from lib import providers
+        finally:
+            sys.path.remove(str(SCRIPTS))
+        calls = []
+
+        def spy(config, local_only=False):
+            calls.append(local_only)
+            return None
+
+        monkeypatch.setattr(providers.env, "get_x_source", spy)
+        providers._resolve_x_backend({"_inject_results": {"x": {}, "web": {}}})
+        providers._resolve_x_backend({})
+        assert calls == [True, False]
+
+    def test_inject_mode_never_spawns_xurl(self, tmp_path):
+        """Behavioral no-network guarantee: a fake `xurl` shim earlier on PATH
+        writes a marker file when executed. The credential-less inject run must
+        never execute it — availability resolves from local evidence only."""
+        import os
+        payload = _run_plan_queries(tmp_path)
+        inject = {"x": {}, "web": {}}
+        for q in payload["queries"]:
+            if q["source"] == "x":
+                inject["x"][q["search_query"]] = [X_ITEM]
+        inject_file = tmp_path / "inject.json"
+        inject_file.write_text(json.dumps(inject), encoding="utf-8")
+        plan_file = tmp_path / "plan-only.json"
+        plan_file.write_text(json.dumps(payload["plan"]), encoding="utf-8")
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        marker = tmp_path / "xurl-invoked"
+        shim = bin_dir / "xurl"
+        shim.write_text(
+            f"#!/bin/sh\ntouch {marker}\n"
+            'echo \'{"data":{"username":"fake"}}\'\nexit 0\n',
+            encoding="utf-8")
+        shim.chmod(0o755)
+
+        env = {"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+               "HOME": str(tmp_path),  # no user config, no keys, no token store
+               "LAST30DAYS_CONFIG_DIR": ""}
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic",
+             "--plan", str(plan_file),
+             "--inject-results", str(inject_file),
+             "--search", "x", "--web-backend", "none",
+             "--emit", "compact"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert not marker.exists(), "inject mode executed xurl (live probe)"
+        assert "x.com/someone/status/123456" in proc.stdout
+
     def test_inject_miss_is_quiet_no_coverage(self, tmp_path):
         """A subquery not present in the inject map must not raise and must
         not fall through to live backends (injected-only policy)."""
