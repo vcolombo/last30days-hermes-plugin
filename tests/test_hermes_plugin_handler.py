@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = ROOT / "tests" / "fixtures" / "hermes"
+X_ERROR_FIXTURE = (FIXTURES / "x_search_error.json").read_text(encoding="utf-8")
+WEB_WRAPPED_FIXTURE = (FIXTURES / "web_search_wrapped.txt").read_text(
+    encoding="utf-8")
 
 
 def _load_plugin():
@@ -148,6 +152,42 @@ class TestHandler:
         ctx = FakeCtx(x_return="no json here at all")
         result = self._invoke(monkeypatch, ctx)
         assert result["ok"] is True  # x stream empty/failed, run continues
+
+    def test_x_search_error_return_marks_query_failed(self, monkeypatch):
+        """Real Hermes v0.18.2 x_search failure return -> failed, not injected."""
+        ctx = FakeCtx(x_return=X_ERROR_FIXTURE)
+        result = self._invoke(monkeypatch, ctx)
+        assert result["ok"] is True
+        statuses = {q["id"]: q["status"] for q in result["coverage"]["queries"]}
+        assert statuses["x1"] == "failed"
+        assert "x1" in result["coverage"]["no_coverage"]
+        assert any("spending-limit" in w for w in result["warnings"])
+
+    def test_web_results_parses_wrapped_data_web_shape(self, monkeypatch):
+        """Real wrapped web_search return: banner stripped, data.web found."""
+        plugin = _load_plugin()
+        results = plugin._web_results(WEB_WRAPPED_FIXTURE)
+        assert len(results) == 2
+        assert all(isinstance(r, dict) for r in results)
+        assert "https://hermesatlas.com/" in [r["url"] for r in results]
+        # End to end: query injected with 2 items, snippet from description.
+        ctx = FakeCtx(web_return=WEB_WRAPPED_FIXTURE)
+        result = self._invoke(monkeypatch, ctx)
+        assert result["ok"] is True
+        by_id = {q["id"]: q for q in result["coverage"]["queries"]}
+        assert by_id["w1"]["status"] == "injected"
+        assert by_id["w1"]["items"] == 2
+        items = plugin._fetch_web(FakeCtx(web_return=WEB_WRAPPED_FIXTURE),
+                                  "q", {})
+        assert items[0]["snippet"] == "Hermes Agent, memory, and the ecosystem..."
+
+    def test_web_search_error_marks_query_failed(self, monkeypatch):
+        ctx = FakeCtx(web_return=json.dumps(
+            {"success": False, "error": "quota"}))
+        result = self._invoke(monkeypatch, ctx)
+        assert result["ok"] is True
+        statuses = {q["id"]: q["status"] for q in result["coverage"]["queries"]}
+        assert statuses["w1"] == "failed"
 
 
 class TestCitationFallback:

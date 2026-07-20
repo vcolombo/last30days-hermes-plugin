@@ -216,6 +216,14 @@ def _fetch_x(ctx, query: str, payload: dict, depth: str) -> list[dict]:
         "from_date": payload.get("from_date"),
         "to_date": payload.get("to_date"),
     })
+    data = raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(_unwrap(raw))
+        except json.JSONDecodeError:
+            data = None  # plain text; fall through to the text path
+    if isinstance(data, dict):
+        _raise_on_tool_error(data)
     text = _extract_text(raw)
     try:
         # Compat path: hermes hands the prompt to xAI, which usually obeys the
@@ -289,12 +297,19 @@ def _web_results(raw) -> list:
     data = raw
     if isinstance(raw, str):
         try:
-            data = json.loads(raw)
+            data = json.loads(_unwrap(raw))
         except json.JSONDecodeError:
             return []
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
+        _raise_on_tool_error(data)
+        # Real Hermes v0.18.2 shape: {"success": true, "data": {"web": [...]}}
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            for key in ("web", "results", "items"):
+                if isinstance(inner.get(key), list):
+                    return inner[key]
         for key in ("results", "items", "data"):
             if isinstance(data.get(key), list):
                 return data[key]
@@ -313,8 +328,31 @@ def _engine_lib(name: str):
     return importlib.import_module(f"lib.{name}")
 
 
+def _unwrap(raw: str) -> str:
+    """Strip Hermes' <untrusted_tool_result> wrapper + prose banner, if any."""
+    open_at = raw.find("<untrusted_tool_result")
+    if open_at == -1:
+        return raw
+    start = raw.find(">", open_at) + 1
+    end = raw.find("</untrusted_tool_result>", start)
+    inner = raw[start:end if end != -1 else len(raw)]
+    brace = inner.find("{")  # adapters only ever need the JSON object
+    return inner[brace:] if brace != -1 else inner
+
+
+def _raise_on_tool_error(data: dict) -> None:
+    """Explicit tool failure -> raise so _fetch_all marks the query failed."""
+    payload_keys = ("data", "results", "items", "web",
+                    "output", "text", "content", "result", "answer")
+    if data.get("success") is False or (
+            data.get("error") and not any(data.get(k) for k in payload_keys)):
+        raise RuntimeError(
+            f"{data.get('tool') or 'tool'} error: {data.get('error')}")
+
+
 def _extract_text(raw) -> str:
     if isinstance(raw, str):
+        raw = _unwrap(raw)
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
