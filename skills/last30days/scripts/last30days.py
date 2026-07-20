@@ -1721,10 +1721,14 @@ def _config_policy_for_args(args: argparse.Namespace, topic: str, extra_argv: li
     elif (
         args.diagnose or args.preflight or normalized_topic == "doctor"
         or is_library_command or is_cached_verification
+        or getattr(args, "plan_queries", False)
+        or getattr(args, "inject_results", None)
     ):
         # doctor is plan-only like --diagnose: it must never read cookies.
         # Cache-only freshness verification hits only point APIs (Polymarket,
         # GitHub, StockTwits) - no cookie-backed source, so no Keychain prompt.
+        # Two-phase host modes (--plan-queries / --inject-results) are plan-only
+        # too: X comes via Hermes, never from browser cookies.
         browser_mode = "plan_only"
     elif normalized_topic == "setup":
         browser_mode = "read" if _setup_allows_browser_cookies(args, extra_argv) else "off"
@@ -2206,6 +2210,9 @@ def _main(
         and not args.diagnose
         and not args.mock
         and not args.record_fixtures
+        # Two-phase host modes are agent-local and never route to the hosted backend.
+        and not args.plan_queries
+        and not args.inject_results
         and env.read_secret_env("LAST30DAYS_API_KEY")
         and os.environ.get("LAST30DAYS_API_BASE")
         and not resolved_corpus_dirs

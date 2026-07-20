@@ -303,6 +303,72 @@ class TestHandler:
         assert statuses["w1"] == "failed"
         assert "w1" in result["coverage"]["no_coverage"]
 
+    def test_malformed_structured_x_return_marks_query_failed(self, monkeypatch):
+        """A structured non-error dict with no items and no citations is not a
+        genuine empty result — mark the query failed (no_coverage), never a
+        silent zero-result injection."""
+        ctx = FakeCtx(x_return='{"foo": "bar"}')
+        result = self._invoke(monkeypatch, ctx)
+        assert result["ok"] is True
+        statuses = {q["id"]: q["status"] for q in result["coverage"]["queries"]}
+        assert statuses["x1"] == "failed"
+        assert "x1" in result["coverage"]["no_coverage"]
+
+    def test_plain_text_x_no_citations_is_genuine_empty(self, monkeypatch):
+        """A plain-text (non-JSON) return with no status URLs is a real empty
+        result: injected as zero, not failed (data is None, not a dict)."""
+        ctx = FakeCtx(x_return="no posts found")
+        result = self._invoke(monkeypatch, ctx)
+        assert result["ok"] is True
+        x1 = next(q for q in result["coverage"]["queries"] if q["id"] == "x1")
+        assert x1["status"] == "injected"
+        assert x1["items"] == 0
+
+
+class TestDispatchPool:
+    """Process-wide circuit breaker on stranded dispatch threads."""
+
+    def test_pool_exhaustion_fails_fast(self, monkeypatch):
+        import threading
+        plugin = _load_plugin()
+        sema = threading.BoundedSemaphore(1)
+        sema.acquire()  # drain the only slot (simulate a stranded hung thread)
+        monkeypatch.setattr(plugin, "_dispatch_slots", sema)
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="pool exhausted"):
+            plugin._dispatch(FakeCtx(), "x_search", {})
+        assert time.monotonic() - t0 < 1  # failed fast, no thread started/hung
+
+    def test_normal_dispatch_releases_slot(self, monkeypatch):
+        import threading
+        plugin = _load_plugin()
+        sema = threading.BoundedSemaphore(2)
+        monkeypatch.setattr(plugin, "_dispatch_slots", sema)
+        out = plugin._dispatch(FakeCtx(), "web_search", {})
+        assert out  # returned the canned web payload
+        # Slot released after normal completion: both slots re-acquirable.
+        assert sema.acquire(blocking=False)
+        assert sema.acquire(blocking=False)
+
+    def test_hung_dispatch_keeps_holding_slot(self, monkeypatch):
+        """A timed-out dispatch must NOT release its slot — the hung thread
+        still holds it, so repeated hangs eventually exhaust the pool."""
+        import threading
+
+        class SlowCtx(FakeCtx):
+            def dispatch_tool(self, name, args, **kwargs):
+                time.sleep(3)
+                return super().dispatch_tool(name, args, **kwargs)
+
+        plugin = _load_plugin()
+        sema = threading.BoundedSemaphore(1)
+        monkeypatch.setattr(plugin, "_dispatch_slots", sema)
+        monkeypatch.setattr(plugin, "DISPATCH_CALL_TIMEOUT_S", 0.2)
+        with pytest.raises(RuntimeError, match="timed out"):
+            plugin._dispatch(SlowCtx(), "x_search", {})
+        # The stranded thread still holds the only slot.
+        assert sema.acquire(blocking=False) is False
+
 
 class TestCitationFallback:
     def test_only_status_urls_accepted(self):
