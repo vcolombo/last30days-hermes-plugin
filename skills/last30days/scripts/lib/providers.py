@@ -321,7 +321,7 @@ def _resolve_x_backend(config: dict[str, Any]) -> str | None:
     # Injected-only mode (Hermes plugin) must resolve from local evidence
     # only — xurl's live leg spawns an authenticated `xurl whoami`.
     return env.get_x_source(
-        config, local_only=bool(config.get("_inject_results")))
+        config, local_only=config.get("_inject_results") is not None)
 
 
 def _require_gemini_31(model: str, *, role: str) -> None:
