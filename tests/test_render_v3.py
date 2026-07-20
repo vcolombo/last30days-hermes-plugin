@@ -1170,3 +1170,57 @@ class TestPolymarketTopMarkets(unittest.TestCase):
         item = self._pm_item("Who wins the primary?", "Kanye", 0.12)
         line = render._polymarket_top_markets([item])[0]
         self.assertIn(": Kanye ", line)
+
+
+class RecencyUnverifiedCoverageTests(unittest.TestCase):
+    """Source Coverage flags recency-unverified (dateless) evidence counts."""
+
+    def _report(self, items):
+        by_source = {}
+        for it in items:
+            by_source.setdefault(it.source, []).append(it)
+        report = sample_report()
+        report.items_by_source = by_source
+        report.source_status = {}
+        report.errors_by_source = {}
+        return report
+
+    def _item(self, source, recency):
+        return schema.SourceItem(
+            item_id="x", source=source, title="T", body="b",
+            url="https://ex.com/a", recency_verified=recency)
+
+    def test_unverified_count_shown(self):
+        report = self._report([
+            self._item("grounding", False),
+            self._item("grounding", False),
+            self._item("grounding", True),
+        ])
+        line = "\n".join(render._render_source_coverage(report))
+        self.assertIn("2 recency-unverified", line)
+
+    def test_all_verified_shows_no_note(self):
+        report = self._report([self._item("grounding", True)])
+        line = "\n".join(render._render_source_coverage(report))
+        self.assertNotIn("recency-unverified", line)
+
+    def test_none_provenance_not_counted(self):
+        # recency_verified=None (never assessed) is not counted as unverified.
+        report = self._report([self._item("reddit", None)])
+        line = "\n".join(render._render_source_coverage(report))
+        self.assertNotIn("recency-unverified", line)
+
+
+class RecencyVerifiedSchemaTests(unittest.TestCase):
+    def test_round_trips_through_dict(self):
+        item = schema.SourceItem(
+            item_id="i", source="grounding", title="T", body="b",
+            url="https://ex.com/a", recency_verified=False)
+        restored = schema.source_item_from_dict(schema.to_dict(item))
+        self.assertIs(False, restored.recency_verified)
+
+    def test_default_none_dropped_from_serialization(self):
+        item = schema.SourceItem(
+            item_id="i", source="reddit", title="T", body="b",
+            url="https://ex.com/a")
+        self.assertNotIn("recency_verified", schema.to_dict(item))

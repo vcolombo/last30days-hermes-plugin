@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Native Hermes plugin (`plugin.yaml` + root `__init__.py`) — install with `hermes plugins install vcolombo/last30days-hermes-plugin`. Registers the `last30days_research` tool (X/web ride the agent's own `x_search`/`web_search` credentials) and the bundled skill.
 - New engine flags: `--plan-queries` / `--plan-queries-out` (plan-only JSON) and `--inject-results` (pre-fetched X/web items, injected-only mode) for two-phase hosts.
+- `recency_verified` provenance on evidence items (True only for a real in-window publication date). Dateless evidence — e.g. injected web from Hermes `web_search`, or open job postings — is flagged, and the report's Source Coverage now shows a per-source `(N recency-unverified)` count so a synthesizer never presents it as proven "last N days" evidence.
 
 ## [3.16.0] - 2026-07-15
 

@@ -250,3 +250,37 @@ class NormalizeV3Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecencyVerifiedTests(unittest.TestCase):
+    """recency_verified provenance: True only for a real in-window date."""
+
+    def _one(self, item, source="grounding", require_date=None):
+        return normalize.normalize_source_items(
+            source, [item], "2026-06-01", "2026-06-30",
+            require_date=require_date)
+
+    def test_dated_in_window_is_verified(self):
+        out = self._one({
+            "id": "g1", "title": "T", "url": "https://ex.com/a",
+            "date": "2026-06-15", "snippet": "s"})
+        self.assertEqual(1, len(out))
+        self.assertIs(True, out[0].recency_verified)
+
+    def test_dateless_web_is_unverified(self):
+        # Injected Hermes web_search shape: no date. Kept via require_date
+        # override, but flagged recency_verified=False.
+        out = self._one({
+            "id": "w1", "title": "Undated", "url": "https://ex.com/b",
+            "date": None, "snippet": "s"}, require_date=False)
+        self.assertEqual(1, len(out))
+        self.assertIs(False, out[0].recency_verified)
+
+    def test_out_of_window_date_is_unverified(self):
+        # A real date outside [from,to] is not verified-recent. Use jobs, which
+        # keeps every posting (date-windowing would drop it from other sources).
+        out = self._one({
+            "id": "j1", "title": "Old role", "url": "https://ex.com/job",
+            "date": "2026-01-01"}, source="jobs")
+        self.assertEqual(1, len(out))
+        self.assertIs(False, out[0].recency_verified)
