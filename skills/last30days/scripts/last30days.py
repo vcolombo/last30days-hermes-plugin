@@ -584,6 +584,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "vs-mode unsupported). Used by two-phase hosts (e.g. the Hermes plugin).")
     parser.add_argument("--plan-queries-out",
                         help="File path for --plan-queries JSON output (default: stdout)")
+    parser.add_argument("--inject-results",
+                        help="JSON file of pre-fetched X/web results keyed by source then "
+                             "search_query ({\"x\": {q: [items]}, \"web\": {q: [items]}}). "
+                             "X/grounding then run injected-only: hits skip live fetch, "
+                             "misses are quiet no-coverage. Used with --plan by two-phase "
+                             "hosts (e.g. the Hermes plugin).")
     parser.add_argument("--save-suffix", help="Suffix for saved output filename (e.g., 'gemini' → kanye-west-raw-gemini.md)")
     parser.add_argument("--subreddits", help="Comma-separated broad/category subreddit names to search (e.g., SaaS,Entrepreneur)")
     parser.add_argument("--dedicated-subreddits", help="Comma-separated entity-home subreddit names (e.g., Kanye,WestSubEver). Pulled in full (top+hot+new) and exempt from the relevance floor since the whole sub is the topic.")
@@ -2334,6 +2340,15 @@ def _main(
                 # Fail fast instead of silently dropping to the internal planner
                 # and burning a paid run the user did not ask for. Mirrors the
                 # --plan file-read branch above and parse_competitors_plan.
+                raise SystemExit(2)
+
+        if args.inject_results:
+            import json as _json2
+            try:
+                with open(args.inject_results, encoding="utf-8") as f:
+                    config["_inject_results"] = _json2.load(f)
+            except (OSError, UnicodeDecodeError, _json2.JSONDecodeError) as exc:
+                sys.stderr.write(f"[Inject] Cannot read --inject-results file: {exc}\n")
                 raise SystemExit(2)
 
         # Auto-resolve: use web search to discover subreddits/handles before planning.

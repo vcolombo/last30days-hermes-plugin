@@ -2899,6 +2899,24 @@ def _retrieve_stream(*args, **kwargs) -> tuple[list[dict], dict]:
     return items, artifact
 
 
+def _injected_results(config: dict[str, Any], kind: str, query: str) -> list[dict] | None:
+    """Pre-fetched results injected via --inject-results for (kind, query).
+
+    Returns the injected list on a hit, or None on a miss. Membership-based:
+    an empty list is a real zero-result hit, never a fallthrough to live
+    backends (injected-only policy — the host that injected results owns the
+    X/web credentials; this process must not use its own).
+    """
+    inj = config.get("_inject_results")
+    if not isinstance(inj, dict):
+        return None
+    bucket = inj.get(kind)
+    if isinstance(bucket, dict) and query in bucket:
+        items = bucket[query]
+        return items if isinstance(items, list) else []
+    return None
+
+
 def _retrieve_stream_impl(
     *,
     topic: str,
@@ -2924,6 +2942,26 @@ def _retrieve_stream_impl(
     if rate_limited_sources is not None and source in rate_limited_sources:
         return [], {}
     from_date, to_date = date_range
+    if source in ("grounding", "x") and config.get("_inject_results") is not None:
+        kind = "web" if source == "grounding" else "x"
+        injected = _injected_results(config, kind, subquery.search_query)
+        if injected is None:
+            # Injected-only mode: dynamically generated queries (retry-thin,
+            # x-handle supplementals) are outside the inject map — report
+            # quiet no-coverage instead of spending this env's credentials.
+            print(
+                f"[Inject] no injected {kind} results for "
+                f"'{subquery.search_query}' — skipping (injected-only mode)",
+                file=sys.stderr,
+            )
+            return [], {}
+        if source == "grounding":
+            return injected, {
+                "label": "injected",
+                "webSearchQueries": [subquery.search_query],
+                "resultCount": len(injected),
+            }
+        return injected, {}
     if mock:
         return _mock_stream_results(source, subquery)
     if source == "grounding":

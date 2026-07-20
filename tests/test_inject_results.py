@@ -58,3 +58,82 @@ class TestPlanQueries:
         emitted = {q["search_query"] for q in payload["queries"]}
         round_tripped = {sq.search_query for sq in plan.subqueries}
         assert emitted <= round_tripped
+
+
+X_ITEM = {
+    "id": "X1", "text": "great post about test topic",
+    "url": "https://x.com/someone/status/123456", "author_handle": "someone",
+    "date": "2026-07-01",
+    "engagement": {"likes": 100, "reposts": 25, "replies": 15, "quotes": 5},
+    "why_relevant": "on topic", "relevance": 0.9,
+}
+WEB_ITEM = {
+    "id": "WI1", "title": "Test topic roundup", "url": "https://example.com/a",
+    "source_domain": "example.com", "snippet": "all about test topic",
+    "date": "2026-07-02", "relevance": 0.8, "why_relevant": "hermes web_search",
+}
+
+
+class TestInjectResults:
+    def _pipeline(self):
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            from lib import pipeline
+        finally:
+            sys.path.remove(str(SCRIPTS))
+        return pipeline
+
+    def test_injected_results_membership_semantics(self):
+        pipeline = self._pipeline()
+        config = {"_inject_results": {"x": {"q1": [X_ITEM], "q2": []}, "web": {}}}
+        assert pipeline._injected_results(config, "x", "q1") == [X_ITEM]
+        # Empty list is a HIT (zero results), not a miss.
+        assert pipeline._injected_results(config, "x", "q2") == []
+        # Absent key is a miss.
+        assert pipeline._injected_results(config, "x", "q3") is None
+        # No injection configured at all.
+        assert pipeline._injected_results({}, "x", "q1") is None
+
+    def test_end_to_end_inject_round_trip(self, tmp_path, monkeypatch):
+        """Plan queries, inject fixtures for them, run phase 3, and assert the
+        injected URLs surface in the rendered output with no live X/web fetch."""
+        payload = _run_plan_queries(tmp_path)
+        inject = {"x": {}, "web": {}}
+        for q in payload["queries"]:
+            bucket = "x" if q["source"] == "x" else "web"
+            inject[bucket][q["search_query"]] = (
+                [X_ITEM] if bucket == "x" else [WEB_ITEM])
+        inject_file = tmp_path / "inject.json"
+        inject_file.write_text(json.dumps(inject), encoding="utf-8")
+        plan_file = tmp_path / "plan-only.json"
+        plan_file.write_text(json.dumps(payload["plan"]), encoding="utf-8")
+
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic",
+             "--plan", str(plan_file),
+             "--inject-results", str(inject_file),
+             "--mock", "--emit", "compact"],
+            capture_output=True, text=True, timeout=180,
+        )
+        assert proc.returncode == 0, proc.stderr
+        # Mock mode keeps every other source offline; the injected items are
+        # only reachable through the injection seam.
+        assert "x.com/someone/status/123456" in proc.stdout or \
+               "example.com/a" in proc.stdout
+
+    def test_inject_miss_is_quiet_no_coverage(self, tmp_path):
+        """A subquery not present in the inject map must not raise and must
+        not fall through to live backends (injected-only policy)."""
+        payload = _run_plan_queries(tmp_path)
+        inject_file = tmp_path / "inject.json"
+        inject_file.write_text(json.dumps({"x": {}, "web": {}}), encoding="utf-8")
+        plan_file = tmp_path / "plan-only.json"
+        plan_file.write_text(json.dumps(payload["plan"]), encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "test topic",
+             "--plan", str(plan_file),
+             "--inject-results", str(inject_file),
+             "--mock", "--emit", "compact"],
+            capture_output=True, text=True, timeout=180,
+        )
+        assert proc.returncode == 0, proc.stderr
