@@ -33,8 +33,17 @@ def normalize_source_items(
     from_date: str,
     to_date: str,
     freshness_mode: str = "balanced_recent",
+    require_date: bool | None = None,
 ) -> list[schema.SourceItem]:
-    """Normalize raw source items, filter by date range, with evergreen fallback for how_to queries."""
+    """Normalize raw source items, filter by date range, with evergreen fallback for how_to queries.
+
+    ``require_date`` overrides the per-source default (None = auto: grounding
+    requires a date, everything else does not). Two-phase hosts inject web
+    results from an agent tool (Hermes ``web_search``) that returns no
+    publication dates; passing ``require_date=False`` keeps that evidence
+    instead of dropping the entire injected web stream — same rationale as the
+    ``jobs`` carve-out above (real evidence whose recency is simply unknown).
+    """
     source = source.lower()
     normalizers = {
         "reddit": _normalize_reddit,
@@ -73,7 +82,8 @@ def normalize_source_items(
         # Simulation" miss: 26 open roles filtered to 3 by a 30-day window).
         # Keep the full board; recency is annotated, not used to drop.
         return normalized
-    require_date = source == "grounding"
+    if require_date is None:
+        require_date = source == "grounding"
     filtered = filter_by_date_range(normalized, from_date, to_date, require_date=require_date)
     if filtered:
         return filtered
