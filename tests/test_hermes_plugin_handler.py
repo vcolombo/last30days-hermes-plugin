@@ -239,3 +239,40 @@ class TestCitationFallback:
                         "https://x.com/alice/status/111"]
         assert all(i["engagement"] is None for i in items)
         assert all(i["why_relevant"] == "citation-fallback" for i in items)
+
+
+X_SUCCESS_ITEMS_FIXTURE = (
+    FIXTURES / "x_search_success_items.json").read_text(encoding="utf-8")
+X_SUCCESS_PLAIN_FIXTURE = (
+    FIXTURES / "x_search_success_plain.json").read_text(encoding="utf-8")
+
+
+class TestLiveSuccessFixtures:
+    """Real Hermes v0.18.2 x_search success returns (captured live 2026-07-20)."""
+
+    def _invoke(self, monkeypatch, ctx):
+        plugin = _load_plugin()
+        monkeypatch.setattr(plugin.subprocess, "run", _fake_run_factory())
+        plugin.register(ctx)
+        handler = ctx.registered_tools["last30days_research"]
+        return json.loads(handler({"topic": "test topic"}))
+
+    def test_structured_prompt_return_parses_full_items(self, monkeypatch):
+        # With the engine's X_SEARCH_PROMPT, grok returns the {"items": [...]}
+        # blob in "answer" — the primary parse path, real engagement included.
+        ctx = FakeCtx(x_return=X_SUCCESS_ITEMS_FIXTURE)
+        result = self._invoke(monkeypatch, ctx)
+        assert result["ok"] is True
+        x1 = next(q for q in result["coverage"]["queries"] if q["id"] == "x1")
+        assert x1["status"] == "injected"
+        assert x1["items"] == 10
+
+    def test_plain_answer_return_falls_back_to_citations(self, monkeypatch):
+        # A narrative (non-blob) answer degrades to the citation fallback:
+        # unique x.com status URLs mined from the markdown, engagement null.
+        ctx = FakeCtx(x_return=X_SUCCESS_PLAIN_FIXTURE)
+        result = self._invoke(monkeypatch, ctx)
+        assert result["ok"] is True
+        x1 = next(q for q in result["coverage"]["queries"] if q["id"] == "x1")
+        assert x1["status"] == "injected"
+        assert x1["items"] == 7
