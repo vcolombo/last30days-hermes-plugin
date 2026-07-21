@@ -79,3 +79,21 @@ def test_monitor_ack_rejects_bad_run_id(tmp_path):
     proc = _run(["monitor-ack", "--monitor", "m1", "--ack-run", "999999"], tmp_path)
     assert proc.returncode == 3
     assert "refused" in proc.stderr
+
+
+def test_monitor_reset_rebaselines(tmp_path):
+    out1 = tmp_path / "d1.json"
+    r1 = _run(["alpha", "--mock", "--store", "--monitor", "m1",
+               "--delta-out", str(out1), "--emit", "compact"], tmp_path)
+    assert r1.returncode == 0, r1.stderr
+    run_id = json.loads(out1.read_text())["run_id"]
+    assert _run(["monitor-ack", "--monitor", "m1", "--ack-run", str(run_id)],
+                tmp_path).returncode == 0
+    reset = _run(["monitor-reset", "--monitor", "m1", "--ack-run", str(run_id)],
+                 tmp_path)
+    assert reset.returncode == 0 and "reset" in reset.stdout
+    out2 = tmp_path / "d2.json"
+    r2 = _run(["alpha", "--mock", "--store", "--monitor", "m1",
+               "--delta-out", str(out2), "--emit", "compact"], tmp_path)
+    assert r2.returncode == 0, r2.stderr
+    assert json.loads(out2.read_text())["status"] == "baseline"  # re-baselined

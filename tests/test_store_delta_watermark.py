@@ -32,9 +32,22 @@ def _new_urls(delta):
 
 
 def test_watermark_roundtrip_and_default_none(store):
-    assert store.get_watermark("m1") is None
-    store.set_watermark("m1", 42)
-    assert store.get_watermark("m1") == 42
+    tid = store.add_topic("Alpha")["id"]
+    assert store.get_watermark("m1", tid) is None
+    store.set_watermark("m1", tid, 42)
+    assert store.get_watermark("m1", tid) == 42
+
+
+def test_cross_topic_monitor_label_isolated(store):
+    ta = store.add_topic("Alpha")["id"]
+    tb = store.add_topic("Beta")["id"]
+    ra = _run(store, ta, ["https://x.com/a"], monitor="m1")
+    assert store.ack_monitor_run("m1", ra)["ok"] is True  # advances (m1, Alpha)
+    # Beta reuses the same monitor label -> independent watermark, still baseline.
+    rb = _run(store, tb, ["https://x.com/b"], monitor="m1")
+    assert store.compute_monitor_delta("m1", tb, rb)["status"] == "baseline"
+    assert store.get_watermark("m1", ta) == ra
+    assert store.get_watermark("m1", tb) is None
 
 
 def test_baseline_when_no_watermark(store):
@@ -88,8 +101,37 @@ def test_missing_previous_when_watermark_run_gone(store):
     # remove_topic deletes runs but leaves the watermark setting; the watermark
     # then points at a run that no longer exists.
     tid = store.add_topic("Alpha")["id"]
-    store.set_watermark("m1", 999999)  # points at a missing run
+    store.set_watermark("m1", tid, 999999)  # points at a missing run
     r2 = _run(store, tid, ["https://x.com/b"], monitor="m1")
     delta = store.compute_monitor_delta("m1", tid, r2)
     assert delta["status"] == "missing_previous"
     assert delta["new_findings"] == []
+
+
+def test_lease_serializes_same_monitor_topic(store):
+    assert store.acquire_lease("m1", "Alpha", "owner-a") is True
+    assert store.acquire_lease("m1", "Alpha", "owner-b") is False   # busy
+    store.release_lease("m1", "Alpha", "owner-a")
+    assert store.acquire_lease("m1", "Alpha", "owner-b") is True     # freed
+
+
+def test_lease_reclaims_stale(store):
+    assert store.acquire_lease("m1", "Alpha", "owner-a", ttl_seconds=0) is True
+    # ttl 0 -> already stale -> a different owner reclaims it.
+    assert store.acquire_lease("m1", "Alpha", "owner-b", ttl_seconds=0) is True
+
+
+def test_lease_different_topic_independent(store):
+    assert store.acquire_lease("m1", "Alpha", "a") is True
+    assert store.acquire_lease("m1", "Beta", "b") is True   # different topic
+
+
+def test_reset_watermark_rebaselines(store):
+    tid = store.add_topic("Alpha")["id"]
+    r1 = _run(store, tid, ["https://x.com/a"], monitor="m1")
+    store.ack_monitor_run("m1", r1)
+    assert store.get_watermark("m1", tid) == r1
+    store.reset_watermark("m1", tid)
+    assert store.get_watermark("m1", tid) is None
+    r2 = _run(store, tid, ["https://x.com/b"], monitor="m1")
+    assert store.compute_monitor_delta("m1", tid, r2)["status"] == "baseline"

@@ -437,10 +437,35 @@ def _scoped_store_db(args: argparse.Namespace) -> Path | None:
     return None
 
 
+def _write_delta_atomic(dest_path: str, obj: dict) -> None:
+    """Write a delta JSON atomically: a unique 0600 temp in the destination
+    directory, fsynced, then renamed into place; the temp is removed on failure.
+    Unique-per-write (mkstemp) so concurrent writers never collide."""
+    import json as _json
+    import os as _os
+    import tempfile as _tf
+    dest = Path(dest_path)
+    fd, tmp = _tf.mkstemp(prefix=".delta-", dir=str(dest.parent))
+    try:
+        _os.fchmod(fd, 0o600)
+        with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_json.dumps(obj))
+            fh.flush()
+            _os.fsync(fh.fileno())
+        _os.replace(tmp, dest)
+    except BaseException:
+        try:
+            _os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def persist_report(report: schema.Report, store_db: Path | None = None,
                    *, monitor: str | None = None,
                    delta_out: str | None = None) -> dict[str, int]:
     import store
+    import uuid as _uuid
 
     private_corpus = _report_has_private_corpus(report)
     with store.scoped_db(store_db):
@@ -449,55 +474,61 @@ def persist_report(report: schema.Report, store_db: Path | None = None,
         store.init_db()
         if private_corpus:
             store.ensure_private_db_files()
-        topic_row = store.add_topic(report.topic)
-        topic_id = topic_row["id"]
-        source_mode = ",".join(sorted(report.items_by_source)) or "v3"
-        run_id = store.record_run(topic_id, source_mode=source_mode,
-                                  status="running", monitor=monitor)
+
+        # Serialize concurrent monitor runs of the same monitor+topic so run ids
+        # are assigned in completion order (see store.acquire_lease). A busy
+        # lease means another run is mid-persist: report `busy` (the cron does
+        # not ack), and the next run picks up the findings.
+        lease_owner = None
+        if delta_out is not None and monitor:
+            lease_owner = _uuid.uuid4().hex
+            if not store.acquire_lease(monitor, report.topic, lease_owner):
+                _write_delta_atomic(delta_out, {
+                    "schema": "delta.v1", "status": "busy", "monitor": monitor,
+                    "run_id": None, "engine_degraded": False,
+                    "counts": {"new": 0, "continued": 0, "dropped": 0},
+                    "new_findings": []})
+                return {"new": 0, "updated": 0}
         try:
-            findings = store.findings_from_report(report)
-            if private_corpus:
-                store.ensure_private_db_files()
-            counts = store.store_findings(run_id, topic_id, findings)
-            store.update_run(
-                run_id,
-                status="completed",
-                findings_new=counts["new"],
-                findings_updated=counts["updated"],
-            )
-            if delta_out is not None:
-                import json as _json
-                import os as _os
-                import tempfile as _tf
-                delta = store.compute_monitor_delta(monitor, topic_id, run_id)
-                # engine_degraded: any attempted source that was not clean
-                # (ok / no-results). The plugin's coverage only sees x/web, so
-                # this surfaces engine-side source failures (reddit/yt/...) too.
-                engine_degraded = any(
-                    o.state not in ("ok", "no-results")
-                    for o in report.source_status.values()
-                    if getattr(o, "attempted", True))
-                delta.update({"schema": "delta.v1", "run_id": run_id,
-                              "monitor": monitor, "engine_degraded": engine_degraded})
-                dest = Path(delta_out)
-                fd, tmp = _tf.mkstemp(prefix=".delta-", dir=str(dest.parent))
-                try:
-                    _os.fchmod(fd, 0o600)
-                    with _os.fdopen(fd, "w", encoding="utf-8") as fh:
-                        fh.write(_json.dumps(delta))
-                        fh.flush()
-                        _os.fsync(fh.fileno())
-                    _os.replace(tmp, dest)
-                except BaseException:
-                    _os.unlink(tmp)
-                    raise
-            return counts
-        except Exception as exc:
-            store.update_run(run_id, status="failed", error_message=str(exc)[:500])
-            raise
+            topic_row = store.add_topic(report.topic)
+            topic_id = topic_row["id"]
+            source_mode = ",".join(sorted(report.items_by_source)) or "v3"
+            run_id = store.record_run(topic_id, source_mode=source_mode,
+                                      status="running", monitor=monitor)
+            try:
+                findings = store.findings_from_report(report)
+                if private_corpus:
+                    store.ensure_private_db_files()
+                counts = store.store_findings(run_id, topic_id, findings)
+                store.update_run(
+                    run_id,
+                    status="completed",
+                    findings_new=counts["new"],
+                    findings_updated=counts["updated"],
+                )
+                if delta_out is not None:
+                    delta = store.compute_monitor_delta(monitor, topic_id, run_id)
+                    # engine_degraded: any attempted source that was not clean
+                    # (ok / no-results). The plugin's coverage only sees x/web,
+                    # so this surfaces engine-side failures (reddit/yt/...) too.
+                    engine_degraded = any(
+                        o.state not in ("ok", "no-results")
+                        for o in report.source_status.values()
+                        if getattr(o, "attempted", True))
+                    delta.update({"schema": "delta.v1", "run_id": run_id,
+                                  "monitor": monitor,
+                                  "engine_degraded": engine_degraded})
+                    _write_delta_atomic(delta_out, delta)
+                return counts
+            except Exception as exc:
+                store.update_run(run_id, status="failed", error_message=str(exc)[:500])
+                raise
+            finally:
+                if private_corpus:
+                    store.ensure_private_db_files()
         finally:
-            if private_corpus:
-                store.ensure_private_db_files()
+            if lease_owner:
+                store.release_lease(monitor, report.topic, lease_owner)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2110,6 +2141,21 @@ def _main(
             sys.stderr.write(f"[Monitor] ack refused: {result.get('reason')}\n")
             return 3
         print("acked")
+        return 0
+    if topic.lower() == "monitor-reset":
+        import store
+        if not args.monitor or args.ack_run is None:
+            sys.stderr.write("[Monitor] monitor-reset requires --monitor and --ack-run\n")
+            return 2
+        with store.scoped_db(None):
+            store.init_db()
+            row = store._run_row(args.ack_run)
+            if row is None or row.get("monitor") != args.monitor:
+                sys.stderr.write(
+                    "[Monitor] monitor-reset: run is not a run of this monitor\n")
+                return 3
+            store.reset_watermark(args.monitor, row["topic_id"])
+        print("reset")
         return 0
     if topic.lower() == "library feed":
         return _run_library_feed(args, config)

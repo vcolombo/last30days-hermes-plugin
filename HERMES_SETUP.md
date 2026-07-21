@@ -126,13 +126,17 @@ only what's NEW since the last delivered run.
 
 **Delivery guarantee (at-least-once).** The delta unions every run since the
 last *acked* run, so a finding surfaced in a run whose delivery failed is
-carried forward and reported later — findings are not lost. The trade-off is a
-possible **re-send**: if the agent crashes after `hermes send` succeeds but
-before `last30days_mark_reported`, the next run re-reports the same items. This
-is at-least-once, not exactly-once (a transactional send + ack is impossible
-against an external channel). A degraded run, or one whose watermark run was
-pruned (`missing_previous`), is reported and **not** acked, so its findings
-resurface rather than being skipped.
+carried forward until delivered — findings are not lost. Concurrent runs of the
+same monitor+topic are serialized by a lease (run ids stay in completion order),
+watermarks are scoped per `(monitor, topic)`, and acks are validated and
+monotonic — so the guarantee holds under concurrent or mislabeled runs, not only
+a strictly serial cron. The one residual is a possible **re-send**: if the agent
+crashes after `hermes send` succeeds but before `last30days_mark_reported`, the
+next run re-reports the same items (at-least-once, not exactly-once — a
+transactional send + ack against an external channel is impossible). A degraded
+run is reported and **not** acked. If a monitor's watermark run was pruned
+(`missing_previous`), the recipe re-baselines via `last30days_monitor_reset`
+(the already-pruned findings are gone).
 
 Create the job — note `--deliver` is **omitted** so the agent owns delivery and
 the watermark ack atomically (no double-send):
@@ -140,7 +144,8 @@ the watermark ack atomically (no double-send):
 ```bash
 hermes cron create "0 9 * * 1" \
   "Call last30days_research once (since_last=true, monitor=\"ai-agents\"). \
-   If it failed, or delta.degraded is true, or delta.status is 'missing_previous', report the issue briefly and do NOT ack. \
+   If it failed, delta.degraded is true, or delta.status is 'busy', report the issue briefly and do NOT ack. \
+   If delta.status is 'missing_previous', call last30days_monitor_reset(monitor, delta.run_id) and return exactly [SILENT]. \
    If delta.status is 'baseline' (first run) or delta.counts.new == 0, call last30days_mark_reported(monitor, delta.run_id) and return exactly [SILENT]. \
    Otherwise summarize delta.new_findings with their URLs, hermes send it to telegram:<chat_id>; \
    on send success call last30days_mark_reported(monitor, delta.run_id); then return exactly [SILENT]." \

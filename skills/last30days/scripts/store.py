@@ -228,6 +228,15 @@ ALTER TABLE research_runs ADD COLUMN monitor TEXT;
 CREATE INDEX IF NOT EXISTS idx_research_runs_monitor
     ON research_runs(monitor, topic_id, id);
 """,
+    4: """
+CREATE TABLE IF NOT EXISTS monitor_leases (
+    monitor TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    acquired_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (monitor, topic)
+);
+""",
 }
 
 
@@ -271,7 +280,15 @@ def _run_migrations(conn: sqlite3.Connection):
 
     for version in sorted(MIGRATIONS.keys()):
         if version > current:
-            conn.executescript(MIGRATIONS[version])
+            try:
+                conn.executescript(MIGRATIONS[version])
+            except sqlite3.OperationalError as exc:
+                # Idempotent recovery: a crash after a non-transactional
+                # `ALTER TABLE ADD COLUMN` but before recording the version
+                # leaves the column already present on the next startup. Treat
+                # an already-applied change as success and record the version.
+                if "duplicate column" not in str(exc).lower():
+                    raise
             conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)", (version,)
             )
@@ -675,19 +692,36 @@ def compute_topic_delta(topic_id: int) -> Dict[str, Any]:
     }
 
 
-def _watermark_key(monitor: str) -> str:
-    return f"watermark:{monitor}"
+def _watermark_key(monitor: str, topic_id: int) -> str:
+    return f"watermark:{monitor}:{topic_id}"
 
 
-def get_watermark(monitor: str) -> Optional[int]:
-    """Last successfully-reported run_id for a monitor, or None."""
-    raw = get_setting(_watermark_key(monitor))
+def get_watermark(monitor: str, topic_id: int) -> Optional[int]:
+    """Last successfully-reported run_id for a (monitor, topic), or None.
+
+    Topic-scoped so reusing a monitor label across topics keeps independent
+    watermarks — a run on one topic can never advance another topic's lineage.
+    """
+    raw = get_setting(_watermark_key(monitor, topic_id))
     return int(raw) if raw and raw.isdigit() else None
 
 
-def set_watermark(monitor: str, run_id: int) -> None:
-    """Advance a monitor's delivery watermark to run_id."""
-    set_setting(_watermark_key(monitor), str(int(run_id)))
+def set_watermark(monitor: str, topic_id: int, run_id: int) -> None:
+    """Raw (monitor, topic) watermark setter. Prefer ack_monitor_run, which
+    validates ownership and advances monotonically in one transaction."""
+    set_setting(_watermark_key(monitor, topic_id), str(int(run_id)))
+
+
+def reset_watermark(monitor: str, topic_id: int) -> None:
+    """Clear a (monitor, topic) watermark so the next run re-baselines. Recovery
+    path for a `missing_previous` monitor whose watermark run was pruned."""
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM settings WHERE key = ?",
+                     (_watermark_key(monitor, topic_id),))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _run_row(run_id: int) -> Optional[Dict[str, Any]]:
@@ -718,23 +752,98 @@ def _monitor_runs_after(monitor: str, topic_id: int, since_run_id: int) -> List[
 
 
 def ack_monitor_run(monitor: str, run_id: int) -> Dict[str, Any]:
-    """Advance a monitor's watermark to run_id, with validation.
+    """Advance the (monitor, topic) watermark to run_id — validated and atomic.
 
-    Refuses to (a) point at a run that is not a completed run of THIS monitor
-    (blocks poisoning by a stray/other-topic/failed id), or (b) regress the
-    watermark (non-monotonic ack, which would re-alert already-reported items).
-    Returns {"ok": bool, "reason"?: str, "run_id"?: int}.
+    In one ``BEGIN IMMEDIATE`` transaction it (a) confirms run_id is a completed
+    run of THIS monitor (blocks poisoning by a stray/other-topic/failed id and
+    derives the run's own topic), and (b) compare-and-swaps the watermark only
+    if run_id is strictly greater than the current one. Concurrent acks
+    serialize on the write lock, so a late lower ack can never regress the
+    watermark. Returns {"ok": bool, "reason"?: str, "run_id"?, "topic_id"?}.
     """
-    row = _run_row(run_id)
-    if row is None or row.get("status") != "completed" or row.get("monitor") != monitor:
-        return {"ok": False,
-                "reason": f"run {run_id} is not a completed run of monitor {monitor!r}"}
-    current = get_watermark(monitor)
-    if current is not None and run_id <= current:
-        return {"ok": False,
-                "reason": f"non-monotonic ack: {run_id} <= watermark {current}"}
-    set_watermark(monitor, run_id)
-    return {"ok": True, "run_id": run_id}
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT topic_id, status, monitor FROM research_runs WHERE id = ?",
+            (run_id,)).fetchone()
+        if row is None or row["status"] != "completed" or row["monitor"] != monitor:
+            conn.rollback()
+            return {"ok": False,
+                    "reason": f"run {run_id} is not a completed run of monitor {monitor!r}"}
+        topic_id = row["topic_id"]
+        key = _watermark_key(monitor, topic_id)
+        cur = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        current = int(cur["value"]) if cur and str(cur["value"]).isdigit() else None
+        if current is not None and run_id <= current:
+            conn.rollback()
+            return {"ok": False,
+                    "reason": f"non-monotonic ack: {run_id} <= watermark {current}"}
+        conn.execute(
+            """INSERT INTO settings (key, value, updated_at)
+               VALUES (?, ?, datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value, updated_at = datetime('now')""",
+            (key, str(run_id)))
+        conn.commit()
+        return {"ok": True, "run_id": run_id, "topic_id": topic_id}
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+LEASE_TTL_SECONDS = 1800
+
+
+def acquire_lease(monitor: str, topic: str, owner: str,
+                  ttl_seconds: float = LEASE_TTL_SECONDS) -> bool:
+    """Atomically take the (monitor, topic) run lease. Returns False if a
+    different owner holds a fresh lease; reclaims a stale one (older than
+    ttl_seconds, i.e. a crashed run).
+
+    Serializes concurrent runs of the same monitor+topic so run ids are assigned
+    in completion order — a slower earlier run cannot be stranded below a later
+    run's acked watermark and lost.
+    """
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT owner, (julianday('now') - julianday(acquired_at)) * 86400.0 AS age "
+            "FROM monitor_leases WHERE monitor = ? AND topic = ?",
+            (monitor, topic)).fetchone()
+        if (row is not None and row["owner"] != owner
+                and row["age"] is not None and row["age"] < ttl_seconds):
+            conn.rollback()
+            return False
+        conn.execute(
+            """INSERT INTO monitor_leases (monitor, topic, owner, acquired_at)
+               VALUES (?, ?, ?, datetime('now'))
+               ON CONFLICT(monitor, topic) DO UPDATE SET
+                   owner = excluded.owner, acquired_at = datetime('now')""",
+            (monitor, topic, owner))
+        conn.commit()
+        return True
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def release_lease(monitor: str, topic: str, owner: str) -> None:
+    """Release a (monitor, topic) lease held by owner (no-op if not held)."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "DELETE FROM monitor_leases WHERE monitor = ? AND topic = ? AND owner = ?",
+            (monitor, topic, owner))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def compute_monitor_delta(
@@ -752,7 +861,7 @@ def compute_monitor_delta(
     base = {"topic": topic["name"] if topic else str(topic_id),
             "monitor": monitor, "current_run_id": current_run_id}
     empty = {"new": 0, "continued": 0, "dropped": 0}
-    watermark = get_watermark(monitor)
+    watermark = get_watermark(monitor, topic_id)
     if watermark is None:
         return {**base, "status": "baseline", "previous_run_id": None,
                 "counts": dict(empty), "new_findings": []}

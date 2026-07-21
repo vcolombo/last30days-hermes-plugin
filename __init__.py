@@ -110,6 +110,43 @@ def _mark_reported_handler(ctx, args) -> str:
         return _error("ack", f"{type(exc).__name__}: {exc}")
 
 
+RESET_SCHEMA = {
+    "name": "last30days_monitor_reset",
+    "description": ("Re-baseline a monitor after a 'missing_previous' delta (its "
+                   "watermark run was pruned). Clears the (monitor, topic) "
+                   "watermark so the next run establishes a fresh baseline. "
+                   "Pruned findings are already gone; this only recovers the "
+                   "monitor from the stuck state."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "monitor": {"type": "string", "description": "Monitor key"},
+            "run_id": {"type": "integer",
+                       "description": "a recent run_id of this monitor (from a delta envelope)"},
+        },
+        "required": ["monitor", "run_id"],
+    },
+}
+
+
+def _monitor_reset_handler(ctx, args) -> str:
+    try:
+        if not isinstance(args, dict):
+            return _error("reset", "arguments must be an object")
+        monitor = str(args.get("monitor") or "").strip()
+        run_id = args.get("run_id")
+        if not monitor or not isinstance(run_id, int):
+            return _error("reset", "monitor (str) and run_id (int) are required")
+        proc = _run_engine(["monitor-reset", "--monitor", monitor,
+                           "--ack-run", str(run_id)], timeout=PLAN_TIMEOUT_S)
+        if proc is None or proc.returncode != 0:
+            return _error("reset", "monitor-reset failed",
+                          proc.stderr if proc else "timeout")
+        return json.dumps({"ok": True, "monitor": monitor, "run_id": run_id})
+    except Exception as exc:  # never raise into the registry
+        return _error("reset", f"{type(exc).__name__}: {exc}")
+
+
 def register(ctx):
     ctx.register_skill("last30days", SKILL_MD)
     ctx.register_tool(
@@ -123,6 +160,12 @@ def register(ctx):
         toolset="research",
         schema=MARK_SCHEMA,
         handler=lambda args, **kwargs: _mark_reported_handler(ctx, args),
+    )
+    ctx.register_tool(
+        name="last30days_monitor_reset",
+        toolset="research",
+        schema=RESET_SCHEMA,
+        handler=lambda args, **kwargs: _monitor_reset_handler(ctx, args),
     )
 
 

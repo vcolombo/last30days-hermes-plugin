@@ -550,3 +550,24 @@ class TestLiveSuccessFixtures:
         x1 = next(q for q in result["coverage"]["queries"] if q["id"] == "x1")
         assert x1["status"] == "injected"
         assert x1["items"] == 7
+
+
+class TestMonitorReset:
+    def test_registers_reset(self):
+        plugin = _load_plugin(); ctx = FakeCtx(); plugin.register(ctx)
+        assert "last30days_monitor_reset" in ctx.registered_tools
+
+    def test_reset_shells_monitor_reset(self, monkeypatch):
+        plugin = _load_plugin(); ctx = FakeCtx()
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = [str(c) for c in cmd]
+            return SimpleNamespace(returncode=0, stdout="reset", stderr="")
+
+        monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+        plugin.register(ctx)
+        out = json.loads(ctx.registered_tools["last30days_monitor_reset"](
+            {"monitor": "m1", "run_id": 5}))
+        assert out["ok"] is True
+        assert "monitor-reset" in seen["cmd"]
