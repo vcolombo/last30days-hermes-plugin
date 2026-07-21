@@ -34,6 +34,8 @@ More install options (claude.ai web, OpenClaw, manual) in the [Install](#install
 
 Zero config. Reddit, HN, Polymarket, and GitHub work immediately. Run it once and the setup wizard unlocks X, YouTube, TikTok, arXiv, Techmeme, and more in 30 seconds.
 
+> **This fork adds native [Hermes Agent](https://github.com/NousResearch/hermes-agent) support.** Installed as a Hermes plugin, X and web queries ride the agent's own `x_search` / `web_search` tools — so **no separate X/web credentials are needed**. Everything else works exactly as upstream. See [Hermes Agent (this fork)](#hermes-agent-this-fork) below, or the full [HERMES_SETUP.md](HERMES_SETUP.md).
+
 ---
 
 Reddit upvotes. X likes. YouTube transcripts. TikTok engagement. Polymarket odds backed by real money and insider information. That's millions of people voting with their attention and their wallets every day. /last30days searches all of it in parallel, scores it by what real people actually engage with, and an AI agent judge synthesizes it into one brief.
@@ -154,12 +156,33 @@ The v3 foundations are all still here: the pre-research brain that resolves the 
 
 | Surface | Install | Updates |
 |---------|---------|---------|
+| **Hermes Agent** (this fork) | `hermes plugins install vcolombo/last30days-hermes-plugin` | `hermes plugins update last30days` |
 | **Claude Code** (recommended) | `/plugin marketplace add mvanhorn/last30days-skill` | Auto via marketplace, or `claude plugin update last30days@last30days-skill` |
 | **Grok** (xAI Build CLI) | `grok plugin marketplace add mvanhorn/last30days-skill` then `grok plugin install last30days` | `grok plugin update last30days` |
 | **Codex, Cursor, Copilot, Gemini CLI, or any of 50+ [Agent Skills](https://agentskills.io) hosts** | `npx skills add mvanhorn/last30days-skill -g` | `npx skills update last30days -g` |
 | **claude.ai** (web) | [Download `last30days.skill`](https://github.com/mvanhorn/last30days-skill/releases/latest/download/last30days.skill) and upload via claude.ai > Customize > Skills > + > Create skill > Upload a skill | Re-download and re-upload |
 | **Claude Desktop** | [Download the `.mcpb` for your platform](https://github.com/mvanhorn/last30days-skill/releases/latest) and drag into Settings > Extensions | Re-download and drag the new bundle in |
 | **OpenClaw** | `clawhub install last30days-official` | `clawhub update last30days-official` |
+
+### Hermes Agent (this fork)
+
+This fork ships as a native [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin. Its point: X and web ride the agent's own credentials, so you don't configure `XAI_API_KEY`, browser cookies, or a web-search backend separately for research.
+
+```bash
+hermes plugins install vcolombo/last30days-hermes-plugin
+hermes plugins enable last30days
+```
+
+Registers two surfaces:
+
+- **Tool `last30days_research`** — a full research run as a native Hermes tool (`topic`, `depth`, `emit`, `lookback_days`). X and web are fetched through the agent's own `x_search` / `web_search` tools; every other source behaves as in the skill install (keyless Reddit/HN/Polymarket out of the box, ScrapeCreators-backed sources still read `SCRAPECREATORS_API_KEY` from the agent environment).
+- **Bundled skill** — the complete upstream skill, unchanged. Load it with `skill_view("last30days:last30days")` for the full flag surface (`doctor`, `--save-dir`, per-source toggles, `--publish`, etc.).
+
+**How it works.** The tool runs in two phases: the engine plans its X/web queries (`--plan-queries`), the plugin fetches each through `dispatch_tool("x_search"/"web_search")`, then the engine re-runs with those results injected (`--inject-results`) into its normal normalization, scoring, and dedup pipeline. Injected evidence is tagged with provenance the report surfaces in Source Coverage: `recency_verified` (dateless injected web — e.g. from `web_search` — is flagged rather than presented as proven "last N days"), and `engagement_verified` (model-reported X engagement counts from `x_search`/xAI are flagged vs authoritative platform APIs).
+
+**Requirements:** `x_search` enabled (`hermes tools`; needs xAI OAuth or `XAI_API_KEY` on the agent) and web search configured. The engine subprocess runs on the Hermes runtime Python via `sys.executable` — no separate `python3.12` binary needed. Update with `hermes plugins update last30days`.
+
+Full guide, including the alternative flat-skill install and troubleshooting, in [HERMES_SETUP.md](HERMES_SETUP.md).
 
 ### Claude Code (recommended)
 
