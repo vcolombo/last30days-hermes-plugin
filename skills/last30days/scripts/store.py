@@ -279,25 +279,36 @@ def _run_migrations(conn: sqlite3.Connection):
     ).fetchone()[0] or 0
 
     for version in sorted(MIGRATIONS.keys()):
-        if version > current:
+        if version <= current:
+            continue
+        # Apply each statement individually (not executescript) so an
+        # already-applied statement can be skipped WITHOUT aborting the rest of
+        # the migration. executescript stops at the first raising statement, so a
+        # crash between an ALTER and its following CREATE INDEX — where the next
+        # startup catches "duplicate column" on the ALTER — would silently skip
+        # the index and record the version anyway, leaving the schema drifted.
+        for stmt in _split_sql_statements(MIGRATIONS[version]):
             try:
-                conn.executescript(MIGRATIONS[version])
+                conn.execute(stmt)
             except sqlite3.OperationalError as exc:
-                # Idempotent recovery: a crash after a non-transactional
-                # `ALTER TABLE ADD COLUMN` but before recording the version — or
-                # a concurrent starter that already applied this migration —
-                # leaves the change already present on the next startup. Treat an
-                # already-applied change ("duplicate column" / "already exists")
-                # as success and record the version.
+                # An already-present change ("duplicate column" / "already
+                # exists") from a crashed or concurrent prior run: skip just this
+                # statement and continue to the next (e.g. the CREATE INDEX).
                 msg = str(exc).lower()
                 if "duplicate column" not in msg and "already exists" not in msg:
                     raise
-            # OR IGNORE so two processes racing the same first migration can't
-            # collide on the version-row PK — the loser silently no-ops.
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
-                (version,),
-            )
+        # OR IGNORE so two processes racing the same first migration can't
+        # collide on the version-row PK — the loser silently no-ops.
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+            (version,),
+        )
+
+
+def _split_sql_statements(script: str) -> List[str]:
+    """Split a migration script into individual statements. The migrations are
+    plain DDL with no ';' inside string literals, so a bare split is safe."""
+    return [s.strip() for s in script.split(";") if s.strip()]
 
 
 # --- Topics ---
@@ -928,6 +939,38 @@ def lease_held_by(monitor: str, topic: str, owner: str,
             (monitor, topic)).fetchone()
         return bool(row is not None and row["owner"] == owner
                     and row["age"] is not None and row["age"] < ttl_seconds)
+    finally:
+        conn.close()
+
+
+def complete_monitor_run(monitor: str, topic: str, owner: str, run_id: int, *,
+                         findings_new: int, findings_updated: int,
+                         ttl_seconds: float = LEASE_TTL_SECONDS) -> bool:
+    """Mark a monitor run completed IFF owner still holds a fresh lease, in one
+    atomic conditional UPDATE. Returns True if it completed.
+
+    This is the fence for #2 (TTL-reclaim TOCTOU) with no check-then-act window:
+    a single UPDATE guarded by an EXISTS on the live lease is atomic, so a run
+    that stalled past the TTL and was reclaimed by another owner cannot complete
+    below the reclaimer's acked watermark and be lost. rowcount == 0 means the
+    lease was lost (or the run is no longer 'running'); the caller marks it
+    failed instead.
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """UPDATE research_runs
+                   SET status = 'completed',
+                       findings_new = ?, findings_updated = ?
+                 WHERE id = ? AND status = 'running' AND EXISTS (
+                     SELECT 1 FROM monitor_leases
+                      WHERE monitor = ? AND topic = ? AND owner = ?
+                        AND (julianday('now') - julianday(acquired_at)) * 86400.0
+                            < ?)""",
+            (findings_new, findings_updated, run_id, monitor, topic, owner,
+             ttl_seconds))
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()
 

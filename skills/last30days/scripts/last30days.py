@@ -480,14 +480,19 @@ def persist_report(report: schema.Report, store_db: Path | None = None,
         # lease means another run is mid-persist: report `busy` (the cron does
         # not ack), and the next run picks up the findings.
         lease_owner = None
-        if delta_out is not None and monitor:
+        if monitor:
+            # Lease every monitor run (not just delta-writing ones) so a run
+            # recorded via the callable API without a delta is still serialized
+            # and id-ordered — an unleased monitor run could otherwise strand
+            # below a later acked watermark.
             lease_owner = _uuid.uuid4().hex
             if not store.acquire_lease(monitor, report.topic, lease_owner):
-                _write_delta_atomic(delta_out, {
-                    "schema": "delta.v1", "status": "busy", "monitor": monitor,
-                    "run_id": None, "engine_degraded": False,
-                    "counts": {"new": 0, "continued": 0, "dropped": 0},
-                    "new_findings": []})
+                if delta_out is not None:
+                    _write_delta_atomic(delta_out, {
+                        "schema": "delta.v1", "status": "busy", "monitor": monitor,
+                        "run_id": None, "engine_degraded": False,
+                        "counts": {"new": 0, "continued": 0, "dropped": 0},
+                        "new_findings": []})
                 return {"new": 0, "updated": 0}
         try:
             topic_row = store.add_topic(report.topic)
@@ -500,29 +505,37 @@ def persist_report(report: schema.Report, store_db: Path | None = None,
                 if private_corpus:
                     store.ensure_private_db_files()
                 counts = store.store_findings(run_id, topic_id, findings)
-                # Fence: if this run stalled past the lease TTL and a different
-                # owner reclaimed the lease, do NOT publish. Completing here would
-                # land this run below the reclaimer's acked watermark and drop it
-                # from every future delta. Mark it failed (invisible to the union)
-                # and report `stale` so the agent does not ack.
-                if lease_owner and not store.lease_held_by(
-                        monitor, report.topic, lease_owner):
-                    store.update_run(run_id, status="failed",
-                                     error_message="lease reclaimed mid-run")
-                    if delta_out is not None:
-                        _write_delta_atomic(delta_out, {
-                            "schema": "delta.v1", "status": "stale",
-                            "monitor": monitor, "run_id": run_id,
-                            "engine_degraded": False,
-                            "counts": {"new": 0, "continued": 0, "dropped": 0},
-                            "new_findings": []})
-                    return counts
-                store.update_run(
-                    run_id,
-                    status="completed",
-                    findings_new=counts["new"],
-                    findings_updated=counts["updated"],
-                )
+                # Fence (atomic): complete the run ONLY if the lease is still held
+                # by us. complete_monitor_run does the ownership check and the
+                # status flip in one conditional UPDATE, so there is no
+                # check-then-act window. If the run stalled past the TTL and a
+                # different owner reclaimed the lease, it does NOT complete here
+                # (which would land it below the reclaimer's acked watermark and
+                # lose it); we mark it failed (invisible to the union) and report
+                # `stale` so the agent does not ack.
+                if lease_owner:
+                    completed = store.complete_monitor_run(
+                        monitor, report.topic, lease_owner, run_id,
+                        findings_new=counts["new"],
+                        findings_updated=counts["updated"])
+                    if not completed:
+                        store.update_run(run_id, status="failed",
+                                         error_message="lease reclaimed mid-run")
+                        if delta_out is not None:
+                            _write_delta_atomic(delta_out, {
+                                "schema": "delta.v1", "status": "stale",
+                                "monitor": monitor, "run_id": run_id,
+                                "engine_degraded": False,
+                                "counts": {"new": 0, "continued": 0, "dropped": 0},
+                                "new_findings": []})
+                        return counts
+                else:
+                    store.update_run(
+                        run_id,
+                        status="completed",
+                        findings_new=counts["new"],
+                        findings_updated=counts["updated"],
+                    )
                 if delta_out is not None:
                     delta = store.compute_monitor_delta(monitor, topic_id, run_id)
                     # A baseline run durably anchors its own watermark while the

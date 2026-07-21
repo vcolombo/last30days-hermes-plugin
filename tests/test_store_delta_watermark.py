@@ -161,6 +161,45 @@ def test_lease_held_by_reflects_ownership_and_reclaim(store):
     assert store.lease_held_by("m1", "Alpha", "a") is False
 
 
+def test_complete_monitor_run_fences_reclaimed_lease(store):
+    """The atomic fence (#2): a run completes only while its owner holds the
+    lease. A run whose lease was reclaimed can't flip to completed (which would
+    strand it below the reclaimer's watermark)."""
+    tid = store.add_topic("Alpha")["id"]
+    assert store.acquire_lease("m1", "Alpha", "a") is True
+    r1 = store.record_run(tid, source_mode="t", status="running", monitor="m1")
+    assert store.complete_monitor_run("m1", "Alpha", "a", r1,
+                                      findings_new=0, findings_updated=0) is True
+    assert store._run_row(r1)["status"] == "completed"
+    # b reclaims the lease (ttl 0 -> a's is stale); a's next run can't complete.
+    r2 = store.record_run(tid, source_mode="t", status="running", monitor="m1")
+    assert store.acquire_lease("m1", "Alpha", "b", ttl_seconds=0) is True
+    assert store.complete_monitor_run("m1", "Alpha", "a", r2,
+                                      findings_new=0, findings_updated=0) is False
+    assert store._run_row(r2)["status"] == "running"     # fenced, not completed
+
+
+def test_migration_reapply_recreates_missing_index(store):
+    """#4: a crash between the v3 ALTER and its CREATE INDEX must self-heal on the
+    next migration — the caught duplicate-column on the ALTER must NOT skip the
+    following CREATE INDEX (which executescript would have)."""
+    conn = store._connect()
+    try:
+        # Simulate the crash aftermath: monitor column exists (from init) but the
+        # index is gone and the version is rewound to before v3.
+        conn.execute("DROP INDEX IF EXISTS idx_research_runs_monitor")
+        conn.execute("DELETE FROM schema_version WHERE version >= 3")
+        conn.commit()
+        store._run_migrations(conn)   # ALTER -> duplicate column (caught)
+        conn.commit()
+        idx = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_research_runs_monitor'").fetchone()
+        assert idx is not None        # index recreated despite the caught ALTER
+    finally:
+        conn.close()
+
+
 def test_run_migrations_idempotent_on_reapply(store):
     """Concurrent first-migration safety: the losing racer re-runs migrations
     against a DB whose columns/tables already exist and whose version rows are

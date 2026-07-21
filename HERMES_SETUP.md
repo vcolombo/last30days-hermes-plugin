@@ -138,6 +138,15 @@ run is reported and **not** acked. If a monitor's watermark run was pruned
 (`missing_previous`), the recipe re-baselines via `last30days_monitor_reset`
 (the already-pruned findings are gone).
 
+The never-lose guarantee covers runs that **complete under their lease**. One
+bounded exception: if a run's persist step stalls past the lease TTL
+(`LEASE_TTL_SECONDS`, 1800s) and a different run reclaims the lease and is
+acked, the stalled run is abandoned (`stale`) rather than completed below the
+new watermark — so a finding that existed *only* during that >30-minute stall
+window can be missed. The persist step is sub-millisecond in normal operation,
+so this window is a frozen-process pathology, not a routine race; the TTL exists
+for crash recovery, and a crashed run never completes at all.
+
 Create the job — note `--deliver` is **omitted** so the agent owns delivery and
 then the watermark ack (send first, ack only on success — at-least-once, per the
 guarantee above):
