@@ -437,8 +437,44 @@ def _scoped_store_db(args: argparse.Namespace) -> Path | None:
     return None
 
 
-def persist_report(report: schema.Report, store_db: Path | None = None) -> dict[str, int]:
+def _write_delta_atomic(dest_path: str, obj: dict) -> None:
+    """Write a delta JSON atomically: a unique 0600 temp in the destination
+    directory, fsynced, then renamed into place; the temp is removed on failure.
+    Unique-per-write (mkstemp) so concurrent writers never collide."""
+    import json as _json
+    import os as _os
+    import tempfile as _tf
+    dest = Path(dest_path)
+    fd, tmp = _tf.mkstemp(prefix=".delta-", dir=str(dest.parent))
+    try:
+        _os.fchmod(fd, 0o600)
+        with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_json.dumps(obj))
+            fh.flush()
+            _os.fsync(fh.fileno())
+        _os.replace(tmp, dest)
+    except BaseException:
+        try:
+            _os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def persist_report(report: schema.Report, store_db: Path | None = None,
+                   *, monitor: str | None = None,
+                   delta_out: str | None = None) -> dict[str, int]:
     import store
+    import uuid as _uuid
+
+    # Normalize an empty/whitespace monitor to None at the callable boundary. An
+    # empty string is non-None but falsy, so an unnormalized "" would be tagged
+    # onto the run (record_run) yet bypass the `if monitor:` lease — letting two
+    # concurrent empty-monitor runs strand below each other's watermark.
+    if isinstance(monitor, str):
+        monitor = monitor.strip() or None
+    if delta_out is not None and monitor is None:
+        raise ValueError("delta_out requires a non-empty monitor")
 
     private_corpus = _report_has_private_corpus(report)
     with store.scoped_db(store_db):
@@ -447,28 +483,99 @@ def persist_report(report: schema.Report, store_db: Path | None = None) -> dict[
         store.init_db()
         if private_corpus:
             store.ensure_private_db_files()
-        topic_row = store.add_topic(report.topic)
-        topic_id = topic_row["id"]
-        source_mode = ",".join(sorted(report.items_by_source)) or "v3"
-        run_id = store.record_run(topic_id, source_mode=source_mode, status="running")
+
+        # Serialize concurrent monitor runs of the same monitor+topic so run ids
+        # are assigned in completion order (see store.acquire_lease). A busy
+        # lease means another run is mid-persist: report `busy` (the cron does
+        # not ack), and the next run picks up the findings.
+        lease_owner = None
+        if monitor:
+            # Lease every monitor run (not just delta-writing ones) so a run
+            # recorded via the callable API without a delta is still serialized
+            # and id-ordered — an unleased monitor run could otherwise strand
+            # below a later acked watermark.
+            lease_owner = _uuid.uuid4().hex
+            if not store.acquire_lease(monitor, report.topic, lease_owner):
+                if delta_out is not None:
+                    _write_delta_atomic(delta_out, {
+                        "schema": "delta.v1", "status": "busy", "monitor": monitor,
+                        "run_id": None, "engine_degraded": False,
+                        "counts": {"new": 0, "continued": 0, "dropped": 0},
+                        "new_findings": []})
+                return {"new": 0, "updated": 0}
         try:
-            findings = store.findings_from_report(report)
-            if private_corpus:
-                store.ensure_private_db_files()
-            counts = store.store_findings(run_id, topic_id, findings)
-            store.update_run(
-                run_id,
-                status="completed",
-                findings_new=counts["new"],
-                findings_updated=counts["updated"],
-            )
-            return counts
-        except Exception as exc:
-            store.update_run(run_id, status="failed", error_message=str(exc)[:500])
-            raise
+            topic_row = store.add_topic(report.topic)
+            topic_id = topic_row["id"]
+            source_mode = ",".join(sorted(report.items_by_source)) or "v3"
+            run_id = store.record_run(topic_id, source_mode=source_mode,
+                                      status="running", monitor=monitor)
+            try:
+                findings = store.findings_from_report(report)
+                if private_corpus:
+                    store.ensure_private_db_files()
+                counts = store.store_findings(run_id, topic_id, findings)
+                # Fence (atomic): complete the run ONLY if the lease is still held
+                # by us. complete_monitor_run does the ownership check and the
+                # status flip in one conditional UPDATE, so there is no
+                # check-then-act window. If the run stalled past the TTL and a
+                # different owner reclaimed the lease, it does NOT complete here
+                # (which would land it below the reclaimer's acked watermark and
+                # lose it); we mark it failed (invisible to the union) and report
+                # `stale` so the agent does not ack.
+                if lease_owner:
+                    completed = store.complete_monitor_run(
+                        monitor, report.topic, lease_owner, run_id,
+                        findings_new=counts["new"],
+                        findings_updated=counts["updated"])
+                    if not completed:
+                        store.update_run(run_id, status="failed",
+                                         error_message="lease reclaimed mid-run")
+                        if delta_out is not None:
+                            _write_delta_atomic(delta_out, {
+                                "schema": "delta.v1", "status": "stale",
+                                "monitor": monitor, "run_id": run_id,
+                                "engine_degraded": False,
+                                "counts": {"new": 0, "continued": 0, "dropped": 0},
+                                "new_findings": []})
+                        return counts
+                else:
+                    store.update_run(
+                        run_id,
+                        status="completed",
+                        findings_new=counts["new"],
+                        findings_updated=counts["updated"],
+                    )
+                if delta_out is not None:
+                    delta = store.compute_monitor_delta(monitor, topic_id, run_id)
+                    # A baseline run durably anchors its own watermark while the
+                    # lease is held. The next run of this monitor+topic blocks on
+                    # the lease, so by the time it computes its delta it sees this
+                    # baseline as the watermark instead of also reading null and
+                    # re-classifying as baseline (which would suppress, then never
+                    # deliver, its own findings).
+                    if delta.get("status") == "baseline":
+                        store.set_watermark_if_unset(monitor, topic_id, run_id)
+                    # engine_degraded: any attempted source that was not clean
+                    # (ok / no-results). The plugin's coverage only sees x/web,
+                    # so this surfaces engine-side failures (reddit/yt/...) too.
+                    engine_degraded = any(
+                        o.state not in ("ok", "no-results")
+                        for o in report.source_status.values()
+                        if getattr(o, "attempted", True))
+                    delta.update({"schema": "delta.v1", "run_id": run_id,
+                                  "monitor": monitor,
+                                  "engine_degraded": engine_degraded})
+                    _write_delta_atomic(delta_out, delta)
+                return counts
+            except Exception as exc:
+                store.update_run(run_id, status="failed", error_message=str(exc)[:500])
+                raise
+            finally:
+                if private_corpus:
+                    store.ensure_private_db_files()
         finally:
-            if private_corpus:
-                store.ensure_private_db_files()
+            if lease_owner:
+                store.release_lease(monitor, report.topic, lease_owner)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -568,6 +675,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--publish-password",
                         help="Optional shared password for --publish-html or 'library feed --publish'; prefer LAST30DAYS_PUBLISH_PASSWORD to avoid exposing secrets in process lists")
     parser.add_argument("--store", action="store_true", help="Persist ranked findings to the SQLite research store")
+    parser.add_argument("--monitor",
+                        help="Monitor key: scopes the delivery watermark and delta for scheduled monitoring")
+    parser.add_argument("--delta-out",
+                        help="With --store: write the run's delta-vs-watermark JSON to this path (requires --monitor)")
+    parser.add_argument("--ack-run", type=int,
+                        help="With the 'monitor-ack' subcommand: run_id to set as the monitor watermark")
     parser.add_argument("--x-handle", help="X handle for targeted supplemental search")
     parser.add_argument("--x-related", help="Comma-separated related X handles (searched with lower weight)")
     parser.add_argument("--web-backend", default="auto",
@@ -1968,6 +2081,11 @@ def main() -> int:
     # Use parse_known_args so setup sub-flags (--device-auth, --github,
     # --openclaw) pass through without argparse hard-exiting.
     args, extra_argv = parser.parse_known_args()
+    # An empty/whitespace monitor key is meaningless — collapse it to None so
+    # every downstream guard (pairing, ack/reset, lease) treats it as "no
+    # monitor" rather than tagging runs with an unleased empty key.
+    if args.monitor is not None:
+        args.monitor = args.monitor.strip() or None
     if args.record_fixtures:
         with http.recording_requests(Path(args.record_fixtures)):
             return _main(parser, args, extra_argv)
@@ -2063,6 +2181,34 @@ def _main(
             probe="--probe" in extra_argv,
         )
 
+    if topic.lower() == "monitor-ack":
+        import store
+        if not args.monitor or args.ack_run is None:
+            sys.stderr.write("[Monitor] monitor-ack requires --monitor and --ack-run\n")
+            return 2
+        with store.scoped_db(None):
+            store.init_db()
+            result = store.ack_monitor_run(args.monitor, args.ack_run)
+        if not result.get("ok"):
+            sys.stderr.write(f"[Monitor] ack refused: {result.get('reason')}\n")
+            return 3
+        print("acked")
+        return 0
+    if topic.lower() == "monitor-reset":
+        import store
+        if not args.monitor or args.ack_run is None:
+            sys.stderr.write("[Monitor] monitor-reset requires --monitor and --ack-run\n")
+            return 2
+        with store.scoped_db(None):
+            store.init_db()
+            row = store._run_row(args.ack_run)
+            if row is None or row.get("monitor") != args.monitor:
+                sys.stderr.write(
+                    "[Monitor] monitor-reset: run is not a run of this monitor\n")
+                return 3
+            store.reset_watermark(args.monitor, row["topic_id"])
+        print("reset")
+        return 0
     if topic.lower() == "library feed":
         return _run_library_feed(args, config)
     if topic.lower() == "library search" or topic.lower().startswith("library search "):
@@ -2756,8 +2902,22 @@ def _main(
         or config.get("LAST30DAYS_STORE")
         or ""
     ).lower()
-    if args.store or _store_env in ("1", "true", "yes"):
-        counts = persist_report(report, store_db=_scoped_store_db(args))
+    if args.delta_out and not args.monitor:
+        sys.stderr.write("[Monitor] --delta-out requires --monitor\n")
+        return 2
+    # ...and the reverse: a monitor research run MUST write a delta. persist_report
+    # leases every monitor run (see its `if monitor:` block), so this is not about
+    # lease safety — it is that a monitor run with no delta emits no run_id for the
+    # agent to ack, so its watermark could never advance and the run would be
+    # pointless. Pairing them keeps every monitor run ackable.
+    if args.monitor and not args.delta_out:
+        sys.stderr.write("[Monitor] --monitor requires --delta-out\n")
+        return 2
+    # --delta-out implies persistence: the delta needs the run stored, so never
+    # run research and silently write no delta file.
+    if args.store or args.delta_out or _store_env in ("1", "true", "yes"):
+        counts = persist_report(report, store_db=_scoped_store_db(args),
+                                monitor=args.monitor, delta_out=args.delta_out)
         sys.stderr.write(
             f"[last30days] Stored {counts['new']} new, {counts['updated']} updated findings\n"
         )

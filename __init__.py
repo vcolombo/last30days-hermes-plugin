@@ -29,7 +29,14 @@ ENGINE = ROOT / "skills" / "last30days" / "scripts" / "last30days.py"
 SKILL_MD = ROOT / "skills" / "last30days" / "SKILL.md"
 
 PLAN_TIMEOUT_S = 180
-RESEARCH_TIMEOUT_S = 900
+# Phase 3 is the NO-NETWORK inject re-run (render + persist + delta), so it does
+# not need a long budget. Kept well under a Hermes cron turn's default 600s
+# inactivity limit so the plugin's own subprocess timeout fires FIRST and cleans
+# up, rather than cron interrupting the agent and orphaning a live subprocess
+# (which is what makes the monitor lease's stale-reclaim window reachable). For a
+# monitor that legitimately runs long, raise the cron inactivity limit to at
+# least the lease TTL — see HERMES_SETUP.md.
+RESEARCH_TIMEOUT_S = 360
 DISPATCH_DEADLINE_S = 300   # total wall clock for all dispatch_tool calls
 DISPATCH_CALL_TIMEOUT_S = 120  # per-dispatch bound; a hung tool must not block the worker
 MAX_WEB_QUERIES = 6
@@ -64,10 +71,87 @@ TOOL_SCHEMA = {
                      "description": "Output format (default: context)"},
             "lookback_days": {"type": "integer",
                               "description": "Days to look back (default 30)"},
+            "since_last": {"type": "boolean",
+                           "description": "Monitoring mode: persist to the store and return the delta vs this monitor's last reported run (requires monitor)"},
+            "monitor": {"type": "string",
+                        "description": "Monitor key scoping the delivery watermark (required with since_last)"},
         },
         "required": ["topic"],
     },
 }
+
+
+MARK_SCHEMA = {
+    "name": "last30days_mark_reported",
+    "description": ("Advance a monitor's delivery watermark after its findings "
+                   "were delivered. Call ONLY after a successful send (or on a "
+                   "clean zero-new run). Takes the monitor and run_id from a "
+                   "prior last30days_research(since_last=true) envelope."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "monitor": {"type": "string", "description": "Monitor key"},
+            "run_id": {"type": "integer",
+                       "description": "run_id from the research envelope's delta"},
+        },
+        "required": ["monitor", "run_id"],
+    },
+}
+
+
+def _mark_reported_handler(ctx, args) -> str:
+    try:
+        if not isinstance(args, dict):
+            return _error("ack", "arguments must be an object")
+        monitor = str(args.get("monitor") or "").strip()
+        run_id = args.get("run_id")
+        if not monitor or not isinstance(run_id, int):
+            return _error("ack", "monitor (str) and run_id (int) are required")
+        proc = _run_engine(["monitor-ack", "--monitor", monitor,
+                           "--ack-run", str(run_id)], timeout=PLAN_TIMEOUT_S)
+        if proc is None or proc.returncode != 0:
+            return _error("ack", "monitor-ack failed",
+                          proc.stderr if proc else "timeout")
+        return json.dumps({"ok": True, "monitor": monitor, "run_id": run_id})
+    except Exception as exc:  # never raise into the registry
+        return _error("ack", f"{type(exc).__name__}: {exc}")
+
+
+RESET_SCHEMA = {
+    "name": "last30days_monitor_reset",
+    "description": ("Re-baseline a monitor after a 'missing_previous' delta (its "
+                   "watermark run was pruned). Clears the (monitor, topic) "
+                   "watermark so the next run establishes a fresh baseline. "
+                   "Pruned findings are already gone; this only recovers the "
+                   "monitor from the stuck state."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "monitor": {"type": "string", "description": "Monitor key"},
+            "run_id": {"type": "integer",
+                       "description": "a recent run_id of this monitor (from a delta envelope)"},
+        },
+        "required": ["monitor", "run_id"],
+    },
+}
+
+
+def _monitor_reset_handler(ctx, args) -> str:
+    try:
+        if not isinstance(args, dict):
+            return _error("reset", "arguments must be an object")
+        monitor = str(args.get("monitor") or "").strip()
+        run_id = args.get("run_id")
+        if not monitor or not isinstance(run_id, int):
+            return _error("reset", "monitor (str) and run_id (int) are required")
+        proc = _run_engine(["monitor-reset", "--monitor", monitor,
+                           "--ack-run", str(run_id)], timeout=PLAN_TIMEOUT_S)
+        if proc is None or proc.returncode != 0:
+            return _error("reset", "monitor-reset failed",
+                          proc.stderr if proc else "timeout")
+        return json.dumps({"ok": True, "monitor": monitor, "run_id": run_id})
+    except Exception as exc:  # never raise into the registry
+        return _error("reset", f"{type(exc).__name__}: {exc}")
 
 
 def register(ctx):
@@ -77,6 +161,18 @@ def register(ctx):
         toolset="research",
         schema=TOOL_SCHEMA,
         handler=lambda args, **kwargs: _handler(ctx, args),
+    )
+    ctx.register_tool(
+        name="last30days_mark_reported",
+        toolset="research",
+        schema=MARK_SCHEMA,
+        handler=lambda args, **kwargs: _mark_reported_handler(ctx, args),
+    )
+    ctx.register_tool(
+        name="last30days_monitor_reset",
+        toolset="research",
+        schema=RESET_SCHEMA,
+        handler=lambda args, **kwargs: _monitor_reset_handler(ctx, args),
     )
 
 
@@ -96,6 +192,10 @@ def _handler(ctx, args) -> str:
         depth = args.get("depth") or "default"
         emit = args.get("emit") or "context"
         lookback = args.get("lookback_days")
+        since_last = bool(args.get("since_last"))
+        monitor = str(args.get("monitor") or "").strip()
+        if since_last and not monitor:
+            return _error("plan", "since_last requires a monitor key")
 
         shared_flags: list[str] = []
         if depth == "quick":
@@ -137,17 +237,22 @@ def _handler(ctx, args) -> str:
 
         # Phase 3: research with injected results
         t0 = time.monotonic()
+        delta_file = tmpdir / "delta.json"
+        research_flags = list(shared_flags)
+        if since_last:
+            research_flags += ["--store", "--delta-out", str(delta_file),
+                               "--monitor", monitor]
         proc = _run_engine(
             [topic, "--plan", str(plan_file),
              "--inject-results", str(inject_file),
-             "--emit", emit, *shared_flags],
+             "--emit", emit, *research_flags],
             timeout=RESEARCH_TIMEOUT_S)
         if proc is None or proc.returncode != 0:
             return _error("research", "engine research run failed",
                           proc.stderr if proc else "timeout")
         timings["research_s"] = round(time.monotonic() - t0, 1)
 
-        return json.dumps({
+        envelope = {
             "ok": True,
             "report": proc.stdout,
             "coverage": coverage,
@@ -156,7 +261,20 @@ def _handler(ctx, args) -> str:
             "meta": {"topic": topic, "depth": depth, "emit": emit,
                      "from_date": payload.get("from_date"),
                      "to_date": payload.get("to_date")},
-        })
+        }
+        if since_last:
+            degraded = bool(coverage.get("no_coverage")) or any(
+                q.get("status") in ("failed", "skipped-deadline")
+                for q in coverage.get("queries", []))
+            try:
+                delta = json.loads(delta_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                return _error("research", f"since_last: delta unreadable: {exc}")
+            # Degraded if x/web coverage was thin OR the engine flagged an
+            # engine-side source failure (reddit/yt/... exit 0 but incomplete).
+            delta["degraded"] = degraded or bool(delta.get("engine_degraded"))
+            envelope["delta"] = delta
+        return json.dumps(envelope)
     except Exception as exc:  # never raise into the registry
         return _error("fetch", f"{type(exc).__name__}: {exc}")
     finally:

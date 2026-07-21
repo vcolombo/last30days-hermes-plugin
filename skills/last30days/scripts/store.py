@@ -223,6 +223,20 @@ CREATE INDEX IF NOT EXISTS idx_finding_sightings_topic_seen
 CREATE INDEX IF NOT EXISTS idx_finding_sightings_url
     ON finding_sightings(source_url);
 """,
+    3: """
+ALTER TABLE research_runs ADD COLUMN monitor TEXT;
+CREATE INDEX IF NOT EXISTS idx_research_runs_monitor
+    ON research_runs(monitor, topic_id, id);
+""",
+    4: """
+CREATE TABLE IF NOT EXISTS monitor_leases (
+    monitor TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    acquired_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (monitor, topic)
+);
+""",
 }
 
 
@@ -265,11 +279,36 @@ def _run_migrations(conn: sqlite3.Connection):
     ).fetchone()[0] or 0
 
     for version in sorted(MIGRATIONS.keys()):
-        if version > current:
-            conn.executescript(MIGRATIONS[version])
-            conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?)", (version,)
-            )
+        if version <= current:
+            continue
+        # Apply each statement individually (not executescript) so an
+        # already-applied statement can be skipped WITHOUT aborting the rest of
+        # the migration. executescript stops at the first raising statement, so a
+        # crash between an ALTER and its following CREATE INDEX — where the next
+        # startup catches "duplicate column" on the ALTER — would silently skip
+        # the index and record the version anyway, leaving the schema drifted.
+        for stmt in _split_sql_statements(MIGRATIONS[version]):
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as exc:
+                # An already-present change ("duplicate column" / "already
+                # exists") from a crashed or concurrent prior run: skip just this
+                # statement and continue to the next (e.g. the CREATE INDEX).
+                msg = str(exc).lower()
+                if "duplicate column" not in msg and "already exists" not in msg:
+                    raise
+        # OR IGNORE so two processes racing the same first migration can't
+        # collide on the version-row PK — the loser silently no-ops.
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+            (version,),
+        )
+
+
+def _split_sql_statements(script: str) -> List[str]:
+    """Split a migration script into individual statements. The migrations are
+    plain DDL with no ';' inside string literals, so a bare split is safe."""
+    return [s.strip() for s in script.split(";") if s.strip()]
 
 
 # --- Topics ---
@@ -368,18 +407,25 @@ def record_run(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     token_cost: float = 0,
+    monitor: Optional[str] = None,
 ) -> int:
-    """Record a research run. Returns the run ID."""
+    """Record a research run. Returns the run ID.
+
+    ``monitor`` tags the run so a scheduled monitor's run lineage is queryable
+    (its delta unions only its own runs, never interactive ones on the topic).
+    """
     conn = _connect()
     try:
         cursor = conn.execute(
             """INSERT INTO research_runs
                (topic_id, run_date, source_mode, status, error_message,
-                duration_seconds, prompt_tokens, completion_tokens, token_cost)
-               VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?)""",
+                duration_seconds, prompt_tokens, completion_tokens, token_cost,
+                monitor)
+               VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 topic_id, source_mode, status, error_message,
                 duration_seconds, prompt_tokens, completion_tokens, token_cost,
+                monitor,
             ),
         )
         conn.commit()
@@ -660,6 +706,316 @@ def compute_topic_delta(topic_id: int) -> Dict[str, Any]:
         "dropped": len(dropped_urls),
         "sources": _delta_source_counts(findings),
         "findings": findings,
+    }
+
+
+def _watermark_key(monitor: str, topic_id: int) -> str:
+    return f"watermark:{monitor}:{topic_id}"
+
+
+def get_watermark(monitor: str, topic_id: int) -> Optional[int]:
+    """Last successfully-reported run_id for a (monitor, topic), or None.
+
+    Topic-scoped so reusing a monitor label across topics keeps independent
+    watermarks — a run on one topic can never advance another topic's lineage.
+    """
+    raw = get_setting(_watermark_key(monitor, topic_id))
+    return int(raw) if raw and raw.isdigit() else None
+
+
+def set_watermark(monitor: str, topic_id: int, run_id: int) -> None:
+    """Raw (monitor, topic) watermark setter. Prefer ack_monitor_run, which
+    validates ownership and advances monotonically in one transaction."""
+    set_setting(_watermark_key(monitor, topic_id), str(int(run_id)))
+
+
+def set_watermark_if_unset(monitor: str, topic_id: int, run_id: int) -> bool:
+    """Anchor a (monitor, topic) watermark to run_id iff it is currently unset,
+    in one BEGIN IMMEDIATE transaction. Returns True if it anchored.
+
+    Used to durably self-anchor a *baseline* run while its lease is held, so a
+    second run of the same monitor+topic (which blocks on the lease) can't also
+    read a null watermark and re-classify as baseline — which would suppress and
+    then permanently skip its own findings.
+    """
+    key = _watermark_key(monitor, topic_id)
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        if existing is not None:
+            conn.commit()
+            return False
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_at) "
+            "VALUES (?, ?, datetime('now'))",
+            (key, str(int(run_id))))
+        conn.commit()
+        return True
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reset_watermark(monitor: str, topic_id: int) -> None:
+    """Clear a (monitor, topic) watermark so the next run re-baselines. Recovery
+    path for a `missing_previous` monitor whose watermark run was pruned.
+
+    A conditional delete in one BEGIN IMMEDIATE transaction: it clears the
+    watermark ONLY if it still points at a pruned (missing) run. If a later run
+    already re-baselined and acked a real watermark in between, a straggler reset
+    must not blow that valid watermark away (which would re-baseline and suppress
+    fresh findings).
+    """
+    key = _watermark_key(monitor, topic_id)
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        raw = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        wm = None
+        if raw is not None and str(raw["value"]).isdigit():
+            wm = int(raw["value"])
+        if wm is not None:
+            still_missing = conn.execute(
+                "SELECT 1 FROM research_runs WHERE id = ?", (wm,)).fetchone() is None
+            if still_missing:
+                conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _run_row(run_id: int) -> Optional[Dict[str, Any]]:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM research_runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _monitor_runs_after(monitor: str, topic_id: int, since_run_id: int) -> List[int]:
+    """Completed runs for THIS monitor and topic newer than since_run_id, oldest
+    first. Interactive (untagged) runs are excluded, so the union stays clean."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT id FROM research_runs
+               WHERE monitor = ? AND topic_id = ? AND id > ?
+                 AND status = 'completed'
+               ORDER BY id""",
+            (monitor, topic_id, since_run_id),
+        ).fetchall()
+        return [r["id"] for r in rows]
+    finally:
+        conn.close()
+
+
+def ack_monitor_run(monitor: str, run_id: int) -> Dict[str, Any]:
+    """Advance the (monitor, topic) watermark to run_id — validated and atomic.
+
+    In one ``BEGIN IMMEDIATE`` transaction it (a) confirms run_id is a completed
+    run of THIS monitor (blocks poisoning by a stray/other-topic/failed id and
+    derives the run's own topic), and (b) compare-and-swaps the watermark only
+    if run_id is strictly greater than the current one. Concurrent acks
+    serialize on the write lock, so a late lower ack can never regress the
+    watermark. Re-acking the run that is ALREADY the watermark is an idempotent
+    success (retry-safe, and lets the recipe ack a self-anchored baseline);
+    acking a strictly lower run is refused as a regression. Returns
+    {"ok": bool, "reason"?: str, "run_id"?, "topic_id"?}.
+    """
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT topic_id, status, monitor FROM research_runs WHERE id = ?",
+            (run_id,)).fetchone()
+        if row is None or row["status"] != "completed" or row["monitor"] != monitor:
+            conn.rollback()
+            return {"ok": False,
+                    "reason": f"run {run_id} is not a completed run of monitor {monitor!r}"}
+        topic_id = row["topic_id"]
+        key = _watermark_key(monitor, topic_id)
+        cur = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        current = int(cur["value"]) if cur and str(cur["value"]).isdigit() else None
+        if current is not None and run_id == current:
+            conn.rollback()
+            return {"ok": True, "run_id": run_id, "topic_id": topic_id,
+                    "reason": "already at watermark"}
+        if current is not None and run_id < current:
+            conn.rollback()
+            return {"ok": False,
+                    "reason": f"non-monotonic ack: {run_id} < watermark {current}"}
+        conn.execute(
+            """INSERT INTO settings (key, value, updated_at)
+               VALUES (?, ?, datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value, updated_at = datetime('now')""",
+            (key, str(run_id)))
+        conn.commit()
+        return {"ok": True, "run_id": run_id, "topic_id": topic_id}
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+LEASE_TTL_SECONDS = 1800
+
+
+def acquire_lease(monitor: str, topic: str, owner: str,
+                  ttl_seconds: float = LEASE_TTL_SECONDS) -> bool:
+    """Atomically take the (monitor, topic) run lease. Returns False if a
+    different owner holds a fresh lease; reclaims a stale one (older than
+    ttl_seconds, i.e. a crashed run).
+
+    Serializes concurrent runs of the same monitor+topic so run ids are assigned
+    in completion order — a slower earlier run cannot be stranded below a later
+    run's acked watermark and lost.
+    """
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT owner, (julianday('now') - julianday(acquired_at)) * 86400.0 AS age "
+            "FROM monitor_leases WHERE monitor = ? AND topic = ?",
+            (monitor, topic)).fetchone()
+        if (row is not None and row["owner"] != owner
+                and row["age"] is not None and row["age"] < ttl_seconds):
+            conn.rollback()
+            return False
+        conn.execute(
+            """INSERT INTO monitor_leases (monitor, topic, owner, acquired_at)
+               VALUES (?, ?, ?, datetime('now'))
+               ON CONFLICT(monitor, topic) DO UPDATE SET
+                   owner = excluded.owner, acquired_at = datetime('now')""",
+            (monitor, topic, owner))
+        conn.commit()
+        return True
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def release_lease(monitor: str, topic: str, owner: str) -> None:
+    """Release a (monitor, topic) lease held by owner (no-op if not held)."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "DELETE FROM monitor_leases WHERE monitor = ? AND topic = ? AND owner = ?",
+            (monitor, topic, owner))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def lease_held_by(monitor: str, topic: str, owner: str,
+                  ttl_seconds: float = LEASE_TTL_SECONDS) -> bool:
+    """True iff owner still holds a fresh (monitor, topic) lease.
+
+    A fence for the pathological case where a run stalls past the TTL and a
+    different owner reclaims the lease. Before a run marks itself completed and
+    publishes a delta, it re-checks ownership: a reclaimed owner must not keep
+    publishing (its run id would land below the reclaimer's acked watermark and
+    be lost from the union forever).
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT owner, (julianday('now') - julianday(acquired_at)) * 86400.0 AS age "
+            "FROM monitor_leases WHERE monitor = ? AND topic = ?",
+            (monitor, topic)).fetchone()
+        return bool(row is not None and row["owner"] == owner
+                    and row["age"] is not None and row["age"] < ttl_seconds)
+    finally:
+        conn.close()
+
+
+def complete_monitor_run(monitor: str, topic: str, owner: str, run_id: int, *,
+                         findings_new: int, findings_updated: int,
+                         ttl_seconds: float = LEASE_TTL_SECONDS) -> bool:
+    """Mark a monitor run completed IFF owner still holds a fresh lease, in one
+    atomic conditional UPDATE. Returns True if it completed.
+
+    This is the fence for #2 (TTL-reclaim TOCTOU) with no check-then-act window:
+    a single UPDATE guarded by an EXISTS on the live lease is atomic, so a run
+    that stalled past the TTL and was reclaimed by another owner cannot complete
+    below the reclaimer's acked watermark and be lost. rowcount == 0 means the
+    lease was lost (or the run is no longer 'running'); the caller marks it
+    failed instead.
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """UPDATE research_runs
+                   SET status = 'completed',
+                       findings_new = ?, findings_updated = ?
+                 WHERE id = ? AND status = 'running' AND EXISTS (
+                     SELECT 1 FROM monitor_leases
+                      WHERE monitor = ? AND topic = ? AND owner = ?
+                        AND (julianday('now') - julianday(acquired_at)) * 86400.0
+                            < ?)""",
+            (findings_new, findings_updated, run_id, monitor, topic, owner,
+             ttl_seconds))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def compute_monitor_delta(
+    monitor: str, topic_id: int, current_run_id: int
+) -> Dict[str, Any]:
+    """What is new for a monitor since its last DELIVERED (acked) run.
+
+    Diffs the UNION of this monitor's unreported completed runs (every run since
+    the watermark, including the current one) against the watermark run's
+    sighting set. Unioning is what makes it never-lose: a finding surfaced in an
+    undelivered run and gone by the next run is still reported, because it stays
+    in the union until a run that contains it is acked.
+    """
+    topic = _get_topic_by_id(topic_id)
+    base = {"topic": topic["name"] if topic else str(topic_id),
+            "monitor": monitor, "current_run_id": current_run_id}
+    empty = {"new": 0, "continued": 0, "dropped": 0}
+    watermark = get_watermark(monitor, topic_id)
+    if watermark is None:
+        return {**base, "status": "baseline", "previous_run_id": None,
+                "counts": dict(empty), "new_findings": []}
+    if _run_row(watermark) is None:
+        # Watermark points at a pruned/missing run (e.g. remove_topic). Refuse to
+        # auto-ack — a blind diff-vs-empty would re-alert everything.
+        return {**base, "status": "missing_previous", "previous_run_id": watermark,
+                "counts": dict(empty), "new_findings": []}
+    prev = _sightings_by_url(get_sightings_for_run(topic_id, watermark))
+    union: Dict[str, Dict[str, Any]] = {}
+    for rid in _monitor_runs_after(monitor, topic_id, watermark):
+        # Later runs overwrite earlier ones -> freshest sighting wins per URL.
+        union.update(_sightings_by_url(get_sightings_for_run(topic_id, rid)))
+    cur_urls, prev_urls = set(union), set(prev)
+    new_urls = sorted(cur_urls - prev_urls)
+    return {
+        **base,
+        "status": "ok",
+        "previous_run_id": watermark,
+        "counts": {
+            "new": len(new_urls),
+            "continued": len(cur_urls & prev_urls),
+            "dropped": len(prev_urls - cur_urls),
+        },
+        "new_findings": [union[u] for u in new_urls],
     }
 
 

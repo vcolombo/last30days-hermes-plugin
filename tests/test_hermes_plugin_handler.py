@@ -325,6 +325,116 @@ class TestHandler:
         assert x1["items"] == 0
 
 
+class TestSinceLast:
+    def _invoke(self, monkeypatch, ctx, fake_run=None, args=None):
+        plugin = _load_plugin()
+        monkeypatch.setattr(plugin.subprocess, "run",
+                            fake_run or _fake_run_factory())
+        plugin.register(ctx)
+        handler = ctx.registered_tools["last30days_research"]
+        return json.loads(handler(args or {"topic": "t"}))
+
+    def test_since_last_threads_flags_and_returns_delta(self, monkeypatch):
+        ctx = FakeCtx()
+
+        def fake_run(cmd, **kwargs):
+            cmd = [str(c) for c in cmd]
+            if "--plan-queries" in cmd:
+                out = cmd[cmd.index("--plan-queries-out") + 1]
+                Path(out).write_text(json.dumps(PLAN_PAYLOAD), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            assert "--store" in cmd and "--monitor" in cmd
+            dout = cmd[cmd.index("--delta-out") + 1]
+            Path(dout).write_text(json.dumps({
+                "schema": "delta.v1", "run_id": 7, "monitor": "m1",
+                "status": "ok", "counts": {"new": 2, "continued": 1, "dropped": 0},
+                "new_findings": [{"source_url": "https://x.com/z", "source_title": "t"}]}),
+                encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="REPORT", stderr="")
+
+        result = self._invoke(monkeypatch, ctx, fake_run=fake_run,
+                              args={"topic": "t", "since_last": True, "monitor": "m1"})
+        assert result["ok"] is True
+        assert result["delta"]["counts"]["new"] == 2
+        assert result["delta"]["run_id"] == 7
+        assert result["delta"]["degraded"] is False
+
+    def test_since_last_without_monitor_errors(self, monkeypatch):
+        ctx = FakeCtx()
+        result = self._invoke(monkeypatch, ctx,
+                              args={"topic": "t", "since_last": True})
+        assert result["ok"] is False
+        assert result["stage"] == "plan"
+
+    def test_since_last_degraded_when_query_failed(self, monkeypatch):
+        ctx = FakeCtx(fail={"x_search"})   # x1 fails -> degraded
+
+        def fake_run(cmd, **kwargs):
+            cmd = [str(c) for c in cmd]
+            if "--plan-queries" in cmd:
+                Path(cmd[cmd.index("--plan-queries-out") + 1]).write_text(
+                    json.dumps(PLAN_PAYLOAD), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            Path(cmd[cmd.index("--delta-out") + 1]).write_text(json.dumps({
+                "schema": "delta.v1", "run_id": 1, "monitor": "m1", "status": "ok",
+                "counts": {"new": 0, "continued": 0, "dropped": 0}, "new_findings": []}),
+                encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="R", stderr="")
+
+        result = self._invoke(monkeypatch, ctx, fake_run=fake_run,
+                              args={"topic": "t", "since_last": True, "monitor": "m1"})
+        assert result["ok"] is True
+        assert result["delta"]["degraded"] is True
+
+    def test_since_last_degraded_from_engine_source(self, monkeypatch):
+        # Clean x/web coverage, but the engine flagged an engine-side source
+        # failure -> the envelope must still report degraded.
+        ctx = FakeCtx()
+
+        def fake_run(cmd, **kwargs):
+            cmd = [str(c) for c in cmd]
+            if "--plan-queries" in cmd:
+                Path(cmd[cmd.index("--plan-queries-out") + 1]).write_text(
+                    json.dumps(PLAN_PAYLOAD), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            Path(cmd[cmd.index("--delta-out") + 1]).write_text(json.dumps({
+                "schema": "delta.v1", "run_id": 1, "monitor": "m1", "status": "ok",
+                "counts": {"new": 0, "continued": 0, "dropped": 0},
+                "new_findings": [], "engine_degraded": True}), encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="R", stderr="")
+
+        result = self._invoke(monkeypatch, ctx, fake_run=fake_run,
+                              args={"topic": "t", "since_last": True, "monitor": "m1"})
+        assert result["ok"] is True
+        assert result["delta"]["degraded"] is True
+
+
+class TestMarkReported:
+    def test_registers_mark_reported(self):
+        plugin = _load_plugin(); ctx = FakeCtx(); plugin.register(ctx)
+        assert "last30days_mark_reported" in ctx.registered_tools
+
+    def test_mark_reported_shells_monitor_ack(self, monkeypatch):
+        plugin = _load_plugin(); ctx = FakeCtx()
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = [str(c) for c in cmd]
+            return SimpleNamespace(returncode=0, stdout="acked", stderr="")
+
+        monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+        plugin.register(ctx)
+        out = json.loads(ctx.registered_tools["last30days_mark_reported"](
+            {"monitor": "m1", "run_id": 7}))
+        assert out["ok"] is True and out["run_id"] == 7
+        assert "monitor-ack" in seen["cmd"] and "--ack-run" in seen["cmd"]
+
+    def test_mark_reported_bad_args(self):
+        plugin = _load_plugin(); ctx = FakeCtx(); plugin.register(ctx)
+        out = json.loads(ctx.registered_tools["last30days_mark_reported"]({}))
+        assert out["ok"] is False
+
+
 class TestDispatchPool:
     """Process-wide circuit breaker on stranded dispatch threads."""
 
@@ -440,3 +550,24 @@ class TestLiveSuccessFixtures:
         x1 = next(q for q in result["coverage"]["queries"] if q["id"] == "x1")
         assert x1["status"] == "injected"
         assert x1["items"] == 7
+
+
+class TestMonitorReset:
+    def test_registers_reset(self):
+        plugin = _load_plugin(); ctx = FakeCtx(); plugin.register(ctx)
+        assert "last30days_monitor_reset" in ctx.registered_tools
+
+    def test_reset_shells_monitor_reset(self, monkeypatch):
+        plugin = _load_plugin(); ctx = FakeCtx()
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = [str(c) for c in cmd]
+            return SimpleNamespace(returncode=0, stdout="reset", stderr="")
+
+        monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+        plugin.register(ctx)
+        out = json.loads(ctx.registered_tools["last30days_monitor_reset"](
+            {"monitor": "m1", "run_id": 5}))
+        assert out["ok"] is True
+        assert "monitor-reset" in seen["cmd"]
