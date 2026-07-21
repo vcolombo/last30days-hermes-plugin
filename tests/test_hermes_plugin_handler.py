@@ -325,6 +325,68 @@ class TestHandler:
         assert x1["items"] == 0
 
 
+class TestSinceLast:
+    def _invoke(self, monkeypatch, ctx, fake_run=None, args=None):
+        plugin = _load_plugin()
+        monkeypatch.setattr(plugin.subprocess, "run",
+                            fake_run or _fake_run_factory())
+        plugin.register(ctx)
+        handler = ctx.registered_tools["last30days_research"]
+        return json.loads(handler(args or {"topic": "t"}))
+
+    def test_since_last_threads_flags_and_returns_delta(self, monkeypatch):
+        ctx = FakeCtx()
+
+        def fake_run(cmd, **kwargs):
+            cmd = [str(c) for c in cmd]
+            if "--plan-queries" in cmd:
+                out = cmd[cmd.index("--plan-queries-out") + 1]
+                Path(out).write_text(json.dumps(PLAN_PAYLOAD), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            assert "--store" in cmd and "--monitor" in cmd
+            dout = cmd[cmd.index("--delta-out") + 1]
+            Path(dout).write_text(json.dumps({
+                "schema": "delta.v1", "run_id": 7, "monitor": "m1",
+                "status": "ok", "counts": {"new": 2, "continued": 1, "dropped": 0},
+                "new_findings": [{"source_url": "https://x.com/z", "source_title": "t"}]}),
+                encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="REPORT", stderr="")
+
+        result = self._invoke(monkeypatch, ctx, fake_run=fake_run,
+                              args={"topic": "t", "since_last": True, "monitor": "m1"})
+        assert result["ok"] is True
+        assert result["delta"]["counts"]["new"] == 2
+        assert result["delta"]["run_id"] == 7
+        assert result["delta"]["degraded"] is False
+
+    def test_since_last_without_monitor_errors(self, monkeypatch):
+        ctx = FakeCtx()
+        result = self._invoke(monkeypatch, ctx,
+                              args={"topic": "t", "since_last": True})
+        assert result["ok"] is False
+        assert result["stage"] == "plan"
+
+    def test_since_last_degraded_when_query_failed(self, monkeypatch):
+        ctx = FakeCtx(fail={"x_search"})   # x1 fails -> degraded
+
+        def fake_run(cmd, **kwargs):
+            cmd = [str(c) for c in cmd]
+            if "--plan-queries" in cmd:
+                Path(cmd[cmd.index("--plan-queries-out") + 1]).write_text(
+                    json.dumps(PLAN_PAYLOAD), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            Path(cmd[cmd.index("--delta-out") + 1]).write_text(json.dumps({
+                "schema": "delta.v1", "run_id": 1, "monitor": "m1", "status": "ok",
+                "counts": {"new": 0, "continued": 0, "dropped": 0}, "new_findings": []}),
+                encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="R", stderr="")
+
+        result = self._invoke(monkeypatch, ctx, fake_run=fake_run,
+                              args={"topic": "t", "since_last": True, "monitor": "m1"})
+        assert result["ok"] is True
+        assert result["delta"]["degraded"] is True
+
+
 class TestDispatchPool:
     """Process-wide circuit breaker on stranded dispatch threads."""
 

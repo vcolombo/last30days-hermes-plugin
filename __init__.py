@@ -64,6 +64,10 @@ TOOL_SCHEMA = {
                      "description": "Output format (default: context)"},
             "lookback_days": {"type": "integer",
                               "description": "Days to look back (default 30)"},
+            "since_last": {"type": "boolean",
+                           "description": "Monitoring mode: persist to the store and return the delta vs this monitor's last reported run (requires monitor)"},
+            "monitor": {"type": "string",
+                        "description": "Monitor key scoping the delivery watermark (required with since_last)"},
         },
         "required": ["topic"],
     },
@@ -96,6 +100,10 @@ def _handler(ctx, args) -> str:
         depth = args.get("depth") or "default"
         emit = args.get("emit") or "context"
         lookback = args.get("lookback_days")
+        since_last = bool(args.get("since_last"))
+        monitor = str(args.get("monitor") or "").strip()
+        if since_last and not monitor:
+            return _error("plan", "since_last requires a monitor key")
 
         shared_flags: list[str] = []
         if depth == "quick":
@@ -137,17 +145,22 @@ def _handler(ctx, args) -> str:
 
         # Phase 3: research with injected results
         t0 = time.monotonic()
+        delta_file = tmpdir / "delta.json"
+        research_flags = list(shared_flags)
+        if since_last:
+            research_flags += ["--store", "--delta-out", str(delta_file),
+                               "--monitor", monitor]
         proc = _run_engine(
             [topic, "--plan", str(plan_file),
              "--inject-results", str(inject_file),
-             "--emit", emit, *shared_flags],
+             "--emit", emit, *research_flags],
             timeout=RESEARCH_TIMEOUT_S)
         if proc is None or proc.returncode != 0:
             return _error("research", "engine research run failed",
                           proc.stderr if proc else "timeout")
         timings["research_s"] = round(time.monotonic() - t0, 1)
 
-        return json.dumps({
+        envelope = {
             "ok": True,
             "report": proc.stdout,
             "coverage": coverage,
@@ -156,7 +169,18 @@ def _handler(ctx, args) -> str:
             "meta": {"topic": topic, "depth": depth, "emit": emit,
                      "from_date": payload.get("from_date"),
                      "to_date": payload.get("to_date")},
-        })
+        }
+        if since_last:
+            degraded = bool(coverage.get("no_coverage")) or any(
+                q.get("status") in ("failed", "skipped-deadline")
+                for q in coverage.get("queries", []))
+            try:
+                delta = json.loads(delta_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                return _error("research", f"since_last: delta unreadable: {exc}")
+            delta["degraded"] = degraded
+            envelope["delta"] = delta
+        return json.dumps(envelope)
     except Exception as exc:  # never raise into the registry
         return _error("fetch", f"{type(exc).__name__}: {exc}")
     finally:
