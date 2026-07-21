@@ -29,7 +29,14 @@ ENGINE = ROOT / "skills" / "last30days" / "scripts" / "last30days.py"
 SKILL_MD = ROOT / "skills" / "last30days" / "SKILL.md"
 
 PLAN_TIMEOUT_S = 180
-RESEARCH_TIMEOUT_S = 900
+# Phase 3 is the NO-NETWORK inject re-run (render + persist + delta), so it does
+# not need a long budget. Kept well under a Hermes cron turn's default 600s
+# inactivity limit so the plugin's own subprocess timeout fires FIRST and cleans
+# up, rather than cron interrupting the agent and orphaning a live subprocess
+# (which is what makes the monitor lease's stale-reclaim window reachable). For a
+# monitor that legitimately runs long, raise the cron inactivity limit to at
+# least the lease TTL — see HERMES_SETUP.md.
+RESEARCH_TIMEOUT_S = 360
 DISPATCH_DEADLINE_S = 300   # total wall clock for all dispatch_tool calls
 DISPATCH_CALL_TIMEOUT_S = 120  # per-dispatch bound; a hung tool must not block the worker
 MAX_WEB_QUERIES = 6
