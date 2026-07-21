@@ -7,4 +7,5 @@ description: >-
 author: mvanhorn
 provides_tools:
   - last30days_research
+  - last30days_mark_reported
 requires_env: []

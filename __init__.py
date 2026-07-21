@@ -74,6 +74,42 @@ TOOL_SCHEMA = {
 }
 
 
+MARK_SCHEMA = {
+    "name": "last30days_mark_reported",
+    "description": ("Advance a monitor's delivery watermark after its findings "
+                   "were delivered. Call ONLY after a successful send (or on a "
+                   "clean zero-new run). Takes the monitor and run_id from a "
+                   "prior last30days_research(since_last=true) envelope."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "monitor": {"type": "string", "description": "Monitor key"},
+            "run_id": {"type": "integer",
+                       "description": "run_id from the research envelope's delta"},
+        },
+        "required": ["monitor", "run_id"],
+    },
+}
+
+
+def _mark_reported_handler(ctx, args) -> str:
+    try:
+        if not isinstance(args, dict):
+            return _error("ack", "arguments must be an object")
+        monitor = str(args.get("monitor") or "").strip()
+        run_id = args.get("run_id")
+        if not monitor or not isinstance(run_id, int):
+            return _error("ack", "monitor (str) and run_id (int) are required")
+        proc = _run_engine(["monitor-ack", "--monitor", monitor,
+                           "--ack-run", str(run_id)], timeout=PLAN_TIMEOUT_S)
+        if proc is None or proc.returncode != 0:
+            return _error("ack", "monitor-ack failed",
+                          proc.stderr if proc else "timeout")
+        return json.dumps({"ok": True, "monitor": monitor, "run_id": run_id})
+    except Exception as exc:  # never raise into the registry
+        return _error("ack", f"{type(exc).__name__}: {exc}")
+
+
 def register(ctx):
     ctx.register_skill("last30days", SKILL_MD)
     ctx.register_tool(
@@ -81,6 +117,12 @@ def register(ctx):
         toolset="research",
         schema=TOOL_SCHEMA,
         handler=lambda args, **kwargs: _handler(ctx, args),
+    )
+    ctx.register_tool(
+        name="last30days_mark_reported",
+        toolset="research",
+        schema=MARK_SCHEMA,
+        handler=lambda args, **kwargs: _mark_reported_handler(ctx, args),
     )
 
 

@@ -387,6 +387,32 @@ class TestSinceLast:
         assert result["delta"]["degraded"] is True
 
 
+class TestMarkReported:
+    def test_registers_mark_reported(self):
+        plugin = _load_plugin(); ctx = FakeCtx(); plugin.register(ctx)
+        assert "last30days_mark_reported" in ctx.registered_tools
+
+    def test_mark_reported_shells_monitor_ack(self, monkeypatch):
+        plugin = _load_plugin(); ctx = FakeCtx()
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = [str(c) for c in cmd]
+            return SimpleNamespace(returncode=0, stdout="acked", stderr="")
+
+        monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+        plugin.register(ctx)
+        out = json.loads(ctx.registered_tools["last30days_mark_reported"](
+            {"monitor": "m1", "run_id": 7}))
+        assert out["ok"] is True and out["run_id"] == 7
+        assert "monitor-ack" in seen["cmd"] and "--ack-run" in seen["cmd"]
+
+    def test_mark_reported_bad_args(self):
+        plugin = _load_plugin(); ctx = FakeCtx(); plugin.register(ctx)
+        out = json.loads(ctx.registered_tools["last30days_mark_reported"]({}))
+        assert out["ok"] is False
+
+
 class TestDispatchPool:
     """Process-wide circuit breaker on stranded dispatch threads."""
 
