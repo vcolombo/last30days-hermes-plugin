@@ -14,9 +14,11 @@ live here once.
 Load-bearing invariants — read before changing a predicate:
 
 - Membership, not truthiness. ``config["_inject_results"]`` may be an empty dict
-  or list: that is a *real zero-result injection* (the host fetched and got
+  ``{}``: that is a *real zero-result injection* (the host fetched and got
   nothing), which must still count as injected so the engine does not fall
   through to a live backend. Hence ``is not None``, never ``if config.get(...)``.
+  (A non-dict injection file — a JSON list or ``null`` — is rejected at load in
+  ``last30days.py``, so only a dict ever reaches here.)
 - Empty ``--inject-results`` still means two-phase. An empty path string arrives
   as ``args.inject_results == ""``; ``"" is not None`` is True, so a plan-only
   host that passes an empty inject path is still treated as two-phase. Preserved
@@ -30,8 +32,8 @@ predicates, so it can never desync from them.
 def is_injected(config) -> bool:
     """True once pre-fetched results are loaded onto the config.
 
-    An empty dict/list is a genuine zero-result injection and still counts —
-    the engine must not fall through to a live backend on an empty hit.
+    An empty dict is a genuine zero-result injection and still counts — the
+    engine must not fall through to a live backend on an empty hit.
     """
     return config.get("_inject_results") is not None
 

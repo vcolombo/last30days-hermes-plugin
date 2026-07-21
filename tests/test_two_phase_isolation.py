@@ -10,10 +10,50 @@ cannot catch a *missing* gate, so these behaviour tests stand in for it.
 import json
 import subprocess
 import sys
+from unittest import mock
 from pathlib import Path
+
+from lib import pipeline, schema
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "skills" / "last30days" / "scripts" / "last30days.py"
+
+
+class TestJobsWebBackendIsolation:
+    """`jobs` auto-enables for company topics and isn't part of the injection
+    interception; its careers-discovery + tier-3 fallback call
+    grounding.web_search (a configured web backend). In two-phase mode the
+    dispatch must force web_backend='none' so that never fires."""
+
+    def _captured_web_backend(self, config):
+        seen = {}
+
+        def fake_search_jobs(company, date_range, cfg, *, depth="default",
+                             web_backend="auto", explicit=False):
+            seen["web_backend"] = web_backend
+            return [], {}
+
+        sq = schema.SubQuery(label="t", search_query="OpenAI",
+                             ranking_query="OpenAI", sources=["jobs"])
+        rt = schema.ProviderRuntime(reasoning_provider="mock",
+                                    planner_model="mock", rerank_model="mock")
+        with mock.patch("lib.jobs.search_jobs", side_effect=fake_search_jobs):
+            pipeline._retrieve_stream(
+                topic="OpenAI", subquery=sq, source="jobs", config=config,
+                depth="quick", date_range=("2026-06-01", "2026-06-30"),
+                runtime=rt, mock=False, web_backend="auto")
+        return seen.get("web_backend")
+
+    def test_injected_forces_none_backend(self):
+        assert self._captured_web_backend(
+            {"_inject_results": {"x": {}, "web": {}}}) == "none"
+
+    def test_plan_only_forces_none_backend(self):
+        assert self._captured_web_backend(
+            {"_plan_queries_only": True}) == "none"
+
+    def test_normal_run_keeps_configured_backend(self):
+        assert self._captured_web_backend({}) == "auto"
 
 
 def _run(args, tmp_path):

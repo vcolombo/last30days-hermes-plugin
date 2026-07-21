@@ -1,7 +1,7 @@
 """Structural enforcement of the run-mode seam (lib/run_mode.py).
 
 The two-phase inject execution mode ("am I injected / plan-only, so I must
-never touch a live credentialed backend?") was once re-derived inline as raw
+never reach a live X/web evidence backend?") was once re-derived inline as raw
 `config.get("_inject_results") is not None` / `config.get("_plan_queries_only")
 is True` checks at ~9 sites. Nothing forced a new isolation rule to be added at
 every site, so three separate credential-isolation holes shipped — one per

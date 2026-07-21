@@ -3008,7 +3008,12 @@ def _retrieve_stream_impl(
             date_range,
             config,
             depth=depth,
-            web_backend=web_backend,
+            # jobs isn't part of the injection interception above, and its
+            # careers-discovery + tier-3 fallback call grounding.web_search — a
+            # configured web-search backend. In two-phase mode force that to
+            # "none" (a no-op in grounding) so injected/plan-only runs never
+            # reach it; the public ATS/careers scraping tiers still run.
+            web_backend=("none" if run_mode.is_two_phase(config) else web_backend),
             explicit=bool(config.get("_hiring_signals_mode")),
         )
     if source == "reddit":
