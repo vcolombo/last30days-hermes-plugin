@@ -49,7 +49,7 @@ if os.name == "nt":
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from lib import corpus, dates, env, freshness, html_render, http, permission_preflight, pipeline, registers, render, schema, ui
+from lib import corpus, dates, env, freshness, html_render, http, permission_preflight, pipeline, registers, render, run_mode, schema, ui
 
 _child_pids: set[int] = set()
 _child_pids_lock = threading.Lock()
@@ -1721,8 +1721,7 @@ def _config_policy_for_args(args: argparse.Namespace, topic: str, extra_argv: li
     elif (
         args.diagnose or args.preflight or normalized_topic == "doctor"
         or is_library_command or is_cached_verification
-        or getattr(args, "plan_queries", False)
-        or getattr(args, "inject_results", None) is not None
+        or run_mode.planned_two_phase(args)
     ):
         # doctor is plan-only like --diagnose: it must never read cookies.
         # Cache-only freshness verification hits only point APIs (Polymarket,
@@ -2210,11 +2209,11 @@ def _main(
         and not args.diagnose
         and not args.mock
         and not args.record_fixtures
-        # Two-phase host modes are agent-local and never route to the hosted backend.
-        # `is None` (not truthiness) so `--inject-results ""` still counts as
-        # two-phase mode and is rejected locally, never routed remotely.
-        and not args.plan_queries
-        and args.inject_results is None
+        # Two-phase host modes are agent-local and never route to the hosted
+        # backend. planned_two_phase uses `is not None` (not truthiness) so
+        # `--inject-results ""` still counts as two-phase and is rejected
+        # locally, never routed remotely.
+        and not run_mode.planned_two_phase(args)
         and env.read_secret_env("LAST30DAYS_API_KEY")
         and os.environ.get("LAST30DAYS_API_BASE")
         and not resolved_corpus_dirs
@@ -2260,8 +2259,7 @@ def _main(
     # empty path fails at the load guard below.
     diag = pipeline.diagnose(
         config, requested_sources,
-        safe=args.diagnose or args.inject_results is not None
-        or bool(args.plan_queries))
+        safe=args.diagnose or run_mode.planned_two_phase(args))
 
     if args.diagnose:
         print(json.dumps(diag, indent=2, sort_keys=True))

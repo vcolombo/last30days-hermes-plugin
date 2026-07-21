@@ -52,6 +52,7 @@ from . import (
     reddit_public,
     relevance,
     rerank,
+    run_mode,
     schema,
     signals,
     snippet,
@@ -1322,8 +1323,7 @@ def run(
             # Injected-only and plan-only modes must not probe X backends over
             # the network (xurl's availability check is a live authenticated
             # `xurl whoami`).
-            local_only=(config.get("_inject_results") is not None
-                        or config.get("_plan_queries_only") is True),
+            local_only=run_mode.is_two_phase(config),
         )
         if requested_sources:
             available = [source for source in available if source in requested_sources]
@@ -1336,7 +1336,7 @@ def run(
         available = [s for s in available if s != "grounding"]
     elif web_backend in ("brave", "exa", "serper", "parallel", "keyless") and "grounding" not in available:
         available.append("grounding")
-    if plan_queries_only or config.get("_inject_results") is not None:
+    if run_mode.is_two_phase(config):
         # Two-phase hosts (Hermes plugin) fetch X/web themselves via the
         # agent's own tools, so the planner must assign those queries even
         # when this environment has no X/web credentials. The same applies
@@ -1691,7 +1691,7 @@ def run(
                 require_date=(
                     False
                     if source == "grounding"
-                    and config.get("_inject_results") is not None
+                    and run_mode.is_injected(config)
                     else None
                 ),
             )
@@ -2506,7 +2506,7 @@ def _run_supplemental_searches(
     if depth == "quick" or mock:
         return
 
-    if config.get("_inject_results") is not None:
+    if run_mode.is_injected(config):
         # Injected-only mode (Hermes plugin): supplemental X lanes are live
         # credentialed fetches with no injection seam — skip them entirely.
         return
@@ -2974,7 +2974,7 @@ def _retrieve_stream_impl(
     if rate_limited_sources is not None and source in rate_limited_sources:
         return [], {}
     from_date, to_date = date_range
-    if source in ("grounding", "x") and config.get("_inject_results") is not None:
+    if source in ("grounding", "x") and run_mode.is_injected(config):
         kind = "web" if source == "grounding" else "x"
         injected = _injected_results(config, kind, subquery.search_query)
         if injected is None:
