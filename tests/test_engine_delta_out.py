@@ -26,6 +26,17 @@ def test_delta_out_requires_monitor(tmp_path):
     assert "--delta-out requires --monitor" in proc.stderr
 
 
+def test_empty_monitor_normalized_not_stranded(tmp_path):
+    # A whitespace monitor collapses to None, so the pairing guard fires cleanly
+    # instead of tagging an unleased empty-key run (which could strand below a
+    # concurrent empty-key run's watermark).
+    proc = _run(["topic", "--mock", "--store", "--monitor", "   ",
+                 "--delta-out", str(tmp_path / "d.json"), "--emit", "compact"],
+                tmp_path)
+    assert proc.returncode == 2
+    assert "--delta-out requires --monitor" in proc.stderr
+
+
 def test_monitor_requires_delta_out(tmp_path):
     # A monitor run without --delta-out would skip the lease and could strand a
     # run below a later acked watermark; the pairing is rejected.

@@ -467,6 +467,15 @@ def persist_report(report: schema.Report, store_db: Path | None = None,
     import store
     import uuid as _uuid
 
+    # Normalize an empty/whitespace monitor to None at the callable boundary. An
+    # empty string is non-None but falsy, so an unnormalized "" would be tagged
+    # onto the run (record_run) yet bypass the `if monitor:` lease — letting two
+    # concurrent empty-monitor runs strand below each other's watermark.
+    if isinstance(monitor, str):
+        monitor = monitor.strip() or None
+    if delta_out is not None and monitor is None:
+        raise ValueError("delta_out requires a non-empty monitor")
+
     private_corpus = _report_has_private_corpus(report)
     with store.scoped_db(store_db):
         if private_corpus:
@@ -2072,6 +2081,11 @@ def main() -> int:
     # Use parse_known_args so setup sub-flags (--device-auth, --github,
     # --openclaw) pass through without argparse hard-exiting.
     args, extra_argv = parser.parse_known_args()
+    # An empty/whitespace monitor key is meaningless — collapse it to None so
+    # every downstream guard (pairing, ack/reset, lease) treats it as "no
+    # monitor" rather than tagging runs with an unleased empty key.
+    if args.monitor is not None:
+        args.monitor = args.monitor.strip() or None
     if args.record_fixtures:
         with http.recording_requests(Path(args.record_fixtures)):
             return _main(parser, args, extra_argv)
