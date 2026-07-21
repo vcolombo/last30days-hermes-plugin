@@ -663,6 +663,60 @@ def compute_topic_delta(topic_id: int) -> Dict[str, Any]:
     }
 
 
+def _watermark_key(monitor: str) -> str:
+    return f"watermark:{monitor}"
+
+
+def get_watermark(monitor: str) -> Optional[int]:
+    """Last successfully-reported run_id for a monitor, or None."""
+    raw = get_setting(_watermark_key(monitor))
+    return int(raw) if raw and raw.isdigit() else None
+
+
+def set_watermark(monitor: str, run_id: int) -> None:
+    """Advance a monitor's delivery watermark to run_id."""
+    set_setting(_watermark_key(monitor), str(int(run_id)))
+
+
+def compute_delta_since_run(
+    topic_id: int, current_run_id: int, since_run_id: Optional[int]
+) -> Dict[str, Any]:
+    """Sighting-set diff of the current run vs a PINNED prior run (the monitor
+    watermark). ``since_run_id`` None => baseline (first run for this monitor).
+
+    Diffing against a pinned run — not "the latest two runs for the topic" —
+    keeps a monitor's delta immune to interactive runs and other monitors on
+    the same topic.
+    """
+    topic = _get_topic_by_id(topic_id)
+    topic_name = topic["name"] if topic else str(topic_id)
+    current = _sightings_by_url(get_sightings_for_run(topic_id, current_run_id))
+    if since_run_id is None:
+        return {
+            "status": "baseline",
+            "topic": topic_name,
+            "current_run_id": current_run_id,
+            "previous_run_id": None,
+            "counts": {"new": 0, "continued": 0, "dropped": 0},
+            "new_findings": [],
+        }
+    previous = _sightings_by_url(get_sightings_for_run(topic_id, since_run_id))
+    cur_urls, prev_urls = set(current), set(previous)
+    new_urls = sorted(cur_urls - prev_urls)
+    return {
+        "status": "ok",
+        "topic": topic_name,
+        "current_run_id": current_run_id,
+        "previous_run_id": since_run_id,
+        "counts": {
+            "new": len(new_urls),
+            "continued": len(cur_urls & prev_urls),
+            "dropped": len(prev_urls - cur_urls),
+        },
+        "new_findings": [current[u] for u in new_urls],
+    }
+
+
 def _get_topic_by_id(topic_id: int) -> Optional[Dict[str, Any]]:
     conn = _connect()
     try:
