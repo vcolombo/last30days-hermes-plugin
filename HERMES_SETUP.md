@@ -121,8 +121,18 @@ python3.12 scripts/last30days.py --diagnose
 ## Recurring monitoring (Hermes cron)
 
 Schedule agent-native trend-monitoring: a cron turn calls the plugin (so X/web
-ride your own `x_search`/`web_search` — no separate credentials), reports only
-what's NEW since the last delivered run, and never loses an alert.
+ride your own `x_search`/`web_search` — no separate credentials) and reports
+only what's NEW since the last delivered run.
+
+**Delivery guarantee (at-least-once).** The delta unions every run since the
+last *acked* run, so a finding surfaced in a run whose delivery failed is
+carried forward and reported later — findings are not lost. The trade-off is a
+possible **re-send**: if the agent crashes after `hermes send` succeeds but
+before `last30days_mark_reported`, the next run re-reports the same items. This
+is at-least-once, not exactly-once (a transactional send + ack is impossible
+against an external channel). A degraded run, or one whose watermark run was
+pruned (`missing_previous`), is reported and **not** acked, so its findings
+resurface rather than being skipped.
 
 Create the job — note `--deliver` is **omitted** so the agent owns delivery and
 the watermark ack atomically (no double-send):
@@ -130,8 +140,8 @@ the watermark ack atomically (no double-send):
 ```bash
 hermes cron create "0 9 * * 1" \
   "Call last30days_research once (since_last=true, monitor=\"ai-agents\"). \
-   If it failed or delta.degraded is true, report the failure briefly and do NOT ack. \
-   If delta.counts.new == 0, call last30days_mark_reported(monitor, delta.run_id) and return exactly [SILENT]. \
+   If it failed, or delta.degraded is true, or delta.status is 'missing_previous', report the issue briefly and do NOT ack. \
+   If delta.status is 'baseline' (first run) or delta.counts.new == 0, call last30days_mark_reported(monitor, delta.run_id) and return exactly [SILENT]. \
    Otherwise summarize delta.new_findings with their URLs, hermes send it to telegram:<chat_id>; \
    on send success call last30days_mark_reported(monitor, delta.run_id); then return exactly [SILENT]." \
   --name "monitor: ai-agents" --skill last30days

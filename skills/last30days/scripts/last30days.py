@@ -452,7 +452,8 @@ def persist_report(report: schema.Report, store_db: Path | None = None,
         topic_row = store.add_topic(report.topic)
         topic_id = topic_row["id"]
         source_mode = ",".join(sorted(report.items_by_source)) or "v3"
-        run_id = store.record_run(topic_id, source_mode=source_mode, status="running")
+        run_id = store.record_run(topic_id, source_mode=source_mode,
+                                  status="running", monitor=monitor)
         try:
             findings = store.findings_from_report(report)
             if private_corpus:
@@ -467,14 +468,29 @@ def persist_report(report: schema.Report, store_db: Path | None = None,
             if delta_out is not None:
                 import json as _json
                 import os as _os
-                since = store.get_watermark(monitor)
-                delta = store.compute_delta_since_run(topic_id, run_id, since)
-                delta.update({"schema": "delta.v1", "run_id": run_id, "monitor": monitor})
-                tmp = f"{delta_out}.tmp"
-                fd = _os.open(tmp, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
-                with _os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(_json.dumps(delta))
-                _os.replace(tmp, delta_out)
+                import tempfile as _tf
+                delta = store.compute_monitor_delta(monitor, topic_id, run_id)
+                # engine_degraded: any attempted source that was not clean
+                # (ok / no-results). The plugin's coverage only sees x/web, so
+                # this surfaces engine-side source failures (reddit/yt/...) too.
+                engine_degraded = any(
+                    o.state not in ("ok", "no-results")
+                    for o in report.source_status.values()
+                    if getattr(o, "attempted", True))
+                delta.update({"schema": "delta.v1", "run_id": run_id,
+                              "monitor": monitor, "engine_degraded": engine_degraded})
+                dest = Path(delta_out)
+                fd, tmp = _tf.mkstemp(prefix=".delta-", dir=str(dest.parent))
+                try:
+                    _os.fchmod(fd, 0o600)
+                    with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(_json.dumps(delta))
+                        fh.flush()
+                        _os.fsync(fh.fileno())
+                    _os.replace(tmp, dest)
+                except BaseException:
+                    _os.unlink(tmp)
+                    raise
             return counts
         except Exception as exc:
             store.update_run(run_id, status="failed", error_message=str(exc)[:500])
@@ -2089,7 +2105,10 @@ def _main(
             return 2
         with store.scoped_db(None):
             store.init_db()
-            store.set_watermark(args.monitor, args.ack_run)
+            result = store.ack_monitor_run(args.monitor, args.ack_run)
+        if not result.get("ok"):
+            sys.stderr.write(f"[Monitor] ack refused: {result.get('reason')}\n")
+            return 3
         print("acked")
         return 0
     if topic.lower() == "library feed":
@@ -2788,7 +2807,9 @@ def _main(
     if args.delta_out and not args.monitor:
         sys.stderr.write("[Monitor] --delta-out requires --monitor\n")
         return 2
-    if args.store or _store_env in ("1", "true", "yes"):
+    # --delta-out implies persistence: the delta needs the run stored, so never
+    # run research and silently write no delta file.
+    if args.store or args.delta_out or _store_env in ("1", "true", "yes"):
         counts = persist_report(report, store_db=_scoped_store_db(args),
                                 monitor=args.monitor, delta_out=args.delta_out)
         sys.stderr.write(

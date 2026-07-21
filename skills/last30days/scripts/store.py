@@ -223,6 +223,11 @@ CREATE INDEX IF NOT EXISTS idx_finding_sightings_topic_seen
 CREATE INDEX IF NOT EXISTS idx_finding_sightings_url
     ON finding_sightings(source_url);
 """,
+    3: """
+ALTER TABLE research_runs ADD COLUMN monitor TEXT;
+CREATE INDEX IF NOT EXISTS idx_research_runs_monitor
+    ON research_runs(monitor, topic_id, id);
+""",
 }
 
 
@@ -368,18 +373,25 @@ def record_run(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     token_cost: float = 0,
+    monitor: Optional[str] = None,
 ) -> int:
-    """Record a research run. Returns the run ID."""
+    """Record a research run. Returns the run ID.
+
+    ``monitor`` tags the run so a scheduled monitor's run lineage is queryable
+    (its delta unions only its own runs, never interactive ones on the topic).
+    """
     conn = _connect()
     try:
         cursor = conn.execute(
             """INSERT INTO research_runs
                (topic_id, run_date, source_mode, status, error_message,
-                duration_seconds, prompt_tokens, completion_tokens, token_cost)
-               VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?)""",
+                duration_seconds, prompt_tokens, completion_tokens, token_cost,
+                monitor)
+               VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 topic_id, source_mode, status, error_message,
                 duration_seconds, prompt_tokens, completion_tokens, token_cost,
+                monitor,
             ),
         )
         conn.commit()
@@ -678,42 +690,94 @@ def set_watermark(monitor: str, run_id: int) -> None:
     set_setting(_watermark_key(monitor), str(int(run_id)))
 
 
-def compute_delta_since_run(
-    topic_id: int, current_run_id: int, since_run_id: Optional[int]
-) -> Dict[str, Any]:
-    """Sighting-set diff of the current run vs a PINNED prior run (the monitor
-    watermark). ``since_run_id`` None => baseline (first run for this monitor).
+def _run_row(run_id: int) -> Optional[Dict[str, Any]]:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM research_runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
-    Diffing against a pinned run — not "the latest two runs for the topic" —
-    keeps a monitor's delta immune to interactive runs and other monitors on
-    the same topic.
+
+def _monitor_runs_after(monitor: str, topic_id: int, since_run_id: int) -> List[int]:
+    """Completed runs for THIS monitor and topic newer than since_run_id, oldest
+    first. Interactive (untagged) runs are excluded, so the union stays clean."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT id FROM research_runs
+               WHERE monitor = ? AND topic_id = ? AND id > ?
+                 AND status = 'completed'
+               ORDER BY id""",
+            (monitor, topic_id, since_run_id),
+        ).fetchall()
+        return [r["id"] for r in rows]
+    finally:
+        conn.close()
+
+
+def ack_monitor_run(monitor: str, run_id: int) -> Dict[str, Any]:
+    """Advance a monitor's watermark to run_id, with validation.
+
+    Refuses to (a) point at a run that is not a completed run of THIS monitor
+    (blocks poisoning by a stray/other-topic/failed id), or (b) regress the
+    watermark (non-monotonic ack, which would re-alert already-reported items).
+    Returns {"ok": bool, "reason"?: str, "run_id"?: int}.
+    """
+    row = _run_row(run_id)
+    if row is None or row.get("status") != "completed" or row.get("monitor") != monitor:
+        return {"ok": False,
+                "reason": f"run {run_id} is not a completed run of monitor {monitor!r}"}
+    current = get_watermark(monitor)
+    if current is not None and run_id <= current:
+        return {"ok": False,
+                "reason": f"non-monotonic ack: {run_id} <= watermark {current}"}
+    set_watermark(monitor, run_id)
+    return {"ok": True, "run_id": run_id}
+
+
+def compute_monitor_delta(
+    monitor: str, topic_id: int, current_run_id: int
+) -> Dict[str, Any]:
+    """What is new for a monitor since its last DELIVERED (acked) run.
+
+    Diffs the UNION of this monitor's unreported completed runs (every run since
+    the watermark, including the current one) against the watermark run's
+    sighting set. Unioning is what makes it never-lose: a finding surfaced in an
+    undelivered run and gone by the next run is still reported, because it stays
+    in the union until a run that contains it is acked.
     """
     topic = _get_topic_by_id(topic_id)
-    topic_name = topic["name"] if topic else str(topic_id)
-    current = _sightings_by_url(get_sightings_for_run(topic_id, current_run_id))
-    if since_run_id is None:
-        return {
-            "status": "baseline",
-            "topic": topic_name,
-            "current_run_id": current_run_id,
-            "previous_run_id": None,
-            "counts": {"new": 0, "continued": 0, "dropped": 0},
-            "new_findings": [],
-        }
-    previous = _sightings_by_url(get_sightings_for_run(topic_id, since_run_id))
-    cur_urls, prev_urls = set(current), set(previous)
+    base = {"topic": topic["name"] if topic else str(topic_id),
+            "monitor": monitor, "current_run_id": current_run_id}
+    empty = {"new": 0, "continued": 0, "dropped": 0}
+    watermark = get_watermark(monitor)
+    if watermark is None:
+        return {**base, "status": "baseline", "previous_run_id": None,
+                "counts": dict(empty), "new_findings": []}
+    if _run_row(watermark) is None:
+        # Watermark points at a pruned/missing run (e.g. remove_topic). Refuse to
+        # auto-ack — a blind diff-vs-empty would re-alert everything.
+        return {**base, "status": "missing_previous", "previous_run_id": watermark,
+                "counts": dict(empty), "new_findings": []}
+    prev = _sightings_by_url(get_sightings_for_run(topic_id, watermark))
+    union: Dict[str, Dict[str, Any]] = {}
+    for rid in _monitor_runs_after(monitor, topic_id, watermark):
+        # Later runs overwrite earlier ones -> freshest sighting wins per URL.
+        union.update(_sightings_by_url(get_sightings_for_run(topic_id, rid)))
+    cur_urls, prev_urls = set(union), set(prev)
     new_urls = sorted(cur_urls - prev_urls)
     return {
+        **base,
         "status": "ok",
-        "topic": topic_name,
-        "current_run_id": current_run_id,
-        "previous_run_id": since_run_id,
+        "previous_run_id": watermark,
         "counts": {
             "new": len(new_urls),
             "continued": len(cur_urls & prev_urls),
             "dropped": len(prev_urls - cur_urls),
         },
-        "new_findings": [current[u] for u in new_urls],
+        "new_findings": [union[u] for u in new_urls],
     }
 
 

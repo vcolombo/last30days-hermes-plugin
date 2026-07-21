@@ -220,7 +220,9 @@ def _handler(ctx, args) -> str:
                 delta = json.loads(delta_file.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 return _error("research", f"since_last: delta unreadable: {exc}")
-            delta["degraded"] = degraded
+            # Degraded if x/web coverage was thin OR the engine flagged an
+            # engine-side source failure (reddit/yt/... exit 0 but incomplete).
+            delta["degraded"] = degraded or bool(delta.get("engine_degraded"))
             envelope["delta"] = delta
         return json.dumps(envelope)
     except Exception as exc:  # never raise into the registry

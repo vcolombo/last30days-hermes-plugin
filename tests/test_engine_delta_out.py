@@ -62,3 +62,20 @@ def test_monitor_ack_sets_watermark(tmp_path):
 def test_monitor_ack_requires_args(tmp_path):
     proc = _run(["monitor-ack", "--monitor", "m1"], tmp_path)
     assert proc.returncode == 2
+
+
+def test_delta_out_implies_store(tmp_path):
+    # No --store: --delta-out must still persist + write the delta, not run and
+    # silently produce no file.
+    out = tmp_path / "d.json"
+    proc = _run(["alpha", "--mock", "--monitor", "m1",
+                 "--delta-out", str(out), "--emit", "compact"], tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert out.exists()
+    assert json.loads(out.read_text())["monitor"] == "m1"
+
+
+def test_monitor_ack_rejects_bad_run_id(tmp_path):
+    proc = _run(["monitor-ack", "--monitor", "m1", "--ack-run", "999999"], tmp_path)
+    assert proc.returncode == 3
+    assert "refused" in proc.stderr

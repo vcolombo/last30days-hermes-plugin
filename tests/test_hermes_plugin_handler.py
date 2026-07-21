@@ -386,6 +386,28 @@ class TestSinceLast:
         assert result["ok"] is True
         assert result["delta"]["degraded"] is True
 
+    def test_since_last_degraded_from_engine_source(self, monkeypatch):
+        # Clean x/web coverage, but the engine flagged an engine-side source
+        # failure -> the envelope must still report degraded.
+        ctx = FakeCtx()
+
+        def fake_run(cmd, **kwargs):
+            cmd = [str(c) for c in cmd]
+            if "--plan-queries" in cmd:
+                Path(cmd[cmd.index("--plan-queries-out") + 1]).write_text(
+                    json.dumps(PLAN_PAYLOAD), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            Path(cmd[cmd.index("--delta-out") + 1]).write_text(json.dumps({
+                "schema": "delta.v1", "run_id": 1, "monitor": "m1", "status": "ok",
+                "counts": {"new": 0, "continued": 0, "dropped": 0},
+                "new_findings": [], "engine_degraded": True}), encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="R", stderr="")
+
+        result = self._invoke(monkeypatch, ctx, fake_run=fake_run,
+                              args={"topic": "t", "since_last": True, "monitor": "m1"})
+        assert result["ok"] is True
+        assert result["delta"]["degraded"] is True
+
 
 class TestMarkReported:
     def test_registers_mark_reported(self):
