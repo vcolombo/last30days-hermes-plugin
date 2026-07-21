@@ -7,6 +7,7 @@ review of PR #8): the seam lint bans re-scattering the *predicate spelling*, but
 cannot catch a *missing* gate, so these behaviour tests stand in for it.
 """
 
+import ast
 import json
 import subprocess
 import sys
@@ -16,7 +17,65 @@ from pathlib import Path
 from lib import pipeline, schema
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / "skills" / "last30days" / "scripts" / "last30days.py"
+SCRIPTS = ROOT / "skills" / "last30days" / "scripts"
+LIB_DIR = SCRIPTS / "lib"
+ENGINE = SCRIPTS / "last30days.py"
+
+
+# Reviewed allowlist: the ONLY lib modules permitted to call each credentialed
+# web-evidence entrypoint, each with how a two-phase run is kept away from it.
+# A new caller means a new live-evidence route — gate it on run_mode and add it
+# here in the same change (see the sweep in PR #8).
+_GROUNDING_WEB_SEARCH_CALLERS = {
+    "pipeline.py",     # grounding SOURCE dispatch — inject-intercepted; jobs
+                       # dispatch forces web_backend="none" in two-phase.
+    "jobs.py",         # careers-discovery + tier-3 — receive web_backend, which
+                       # the pipeline forces to "none" in two-phase.
+    "competitors.py",  # discover_competitors — its caller gates on is_two_phase.
+    "resolve.py",      # auto_resolve — its callers gate on planned_two_phase /
+                       # is_two_phase.
+}
+_PERPLEXITY_SEARCH_CALLERS = {
+    "pipeline.py",     # the perplexity dispatch — fails closed in two-phase, and
+                       # available_sources drops it from planning.
+}
+
+
+def _attr_call_caller_modules(attr: str, obj: str) -> set[str]:
+    """Basenames of lib modules containing a call to `<obj>.<attr>(...)`."""
+    callers: set[str] = set()
+    for path in LIB_DIR.rglob("*.py"):
+        if "vendor" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == attr
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == obj):
+                callers.add(path.name)
+    return callers
+
+
+class TestEvidenceCallerInventory:
+    """Automates the definitive sweep: no NEW caller of a credentialed
+    web-evidence entrypoint may appear without being gated + allowlisted."""
+
+    def test_grounding_web_search_callers_are_the_reviewed_set(self):
+        assert _attr_call_caller_modules("web_search", "grounding") == \
+            _GROUNDING_WEB_SEARCH_CALLERS, (
+                "A lib module now calls grounding.web_search. In two-phase mode "
+                "that reaches a live web backend the host offloaded. Gate it on "
+                "run_mode.is_two_phase (or force web_backend='none') and update "
+                "_GROUNDING_WEB_SEARCH_CALLERS in this test.")
+
+    def test_perplexity_search_callers_are_the_reviewed_set(self):
+        assert _attr_call_caller_modules("search", "perplexity") == \
+            _PERPLEXITY_SEARCH_CALLERS, (
+                "A lib module now calls perplexity.search — a credentialed web "
+                "source. Gate it on run_mode.is_two_phase and update "
+                "_PERPLEXITY_SEARCH_CALLERS in this test.")
 
 
 class TestJobsWebBackendIsolation:
