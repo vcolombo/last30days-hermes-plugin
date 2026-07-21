@@ -1300,6 +1300,14 @@ def run(
     # assign it (eligible_sources = available ∩ capabilities).
     config["_financial_topic"] = stocktwits.is_financial_topic(topic)
 
+    if plan_queries_only:
+        # Seed the plan-only marker BEFORE the mock/non-mock split so
+        # run_mode.is_two_phase(config) is true in both branches. Mock mode
+        # still resolves the X backend (providers.mock_runtime -> _resolve_x_
+        # backend), which must stay network-free — xurl availability is a live
+        # authenticated `xurl whoami`.
+        config = {**config, "_plan_queries_only": True}
+
     if mock:
         runtime = providers.mock_runtime(config, depth)
         reasoning_provider = None
@@ -1311,11 +1319,6 @@ def run(
         if not requested_sources and not hiring_signals_mode and not _company_topic_likely(topic):
             available = [source for source in available if source != "jobs"]
     else:
-        if plan_queries_only:
-            # Plan-only mode never fetches X; keep backend resolution and
-            # availability probing network-free (xurl availability is a live
-            # authenticated `xurl whoami`). Mirror the inject-mode guard.
-            config = {**config, "_plan_queries_only": True}
         runtime, reasoning_provider = providers.resolve_runtime(config, depth)
         available = available_sources(
             config,
@@ -2939,7 +2942,7 @@ def _injected_results(config: dict[str, Any], kind: str, query: str) -> list[dic
     backends (injected-only policy — the host that injected results owns the
     X/web credentials; this process must not use its own).
     """
-    inj = config.get("_inject_results")
+    inj = run_mode.injected_results(config)
     if not isinstance(inj, dict):
         return None
     bucket = inj.get(kind)
