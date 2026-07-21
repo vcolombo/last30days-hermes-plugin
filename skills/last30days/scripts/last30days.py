@@ -49,7 +49,7 @@ if os.name == "nt":
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from lib import corpus, dates, env, freshness, html_render, http, permission_preflight, pipeline, registers, render, schema, ui
+from lib import corpus, dates, env, freshness, html_render, http, permission_preflight, pipeline, registers, render, run_mode, schema, ui
 
 _child_pids: set[int] = set()
 _child_pids_lock = threading.Lock()
@@ -1721,8 +1721,7 @@ def _config_policy_for_args(args: argparse.Namespace, topic: str, extra_argv: li
     elif (
         args.diagnose or args.preflight or normalized_topic == "doctor"
         or is_library_command or is_cached_verification
-        or getattr(args, "plan_queries", False)
-        or getattr(args, "inject_results", None) is not None
+        or run_mode.planned_two_phase(args)
     ):
         # doctor is plan-only like --diagnose: it must never read cookies.
         # Cache-only freshness verification hits only point APIs (Polymarket,
@@ -2210,11 +2209,11 @@ def _main(
         and not args.diagnose
         and not args.mock
         and not args.record_fixtures
-        # Two-phase host modes are agent-local and never route to the hosted backend.
-        # `is None` (not truthiness) so `--inject-results ""` still counts as
-        # two-phase mode and is rejected locally, never routed remotely.
-        and not args.plan_queries
-        and args.inject_results is None
+        # Two-phase host modes are agent-local and never route to the hosted
+        # backend. planned_two_phase uses `is not None` (not truthiness) so
+        # `--inject-results ""` still counts as two-phase and is rejected
+        # locally, never routed remotely.
+        and not run_mode.planned_two_phase(args)
         and env.read_secret_env("LAST30DAYS_API_KEY")
         and os.environ.get("LAST30DAYS_API_BASE")
         and not resolved_corpus_dirs
@@ -2260,8 +2259,7 @@ def _main(
     # empty path fails at the load guard below.
     diag = pipeline.diagnose(
         config, requested_sources,
-        safe=args.diagnose or args.inject_results is not None
-        or bool(args.plan_queries))
+        safe=args.diagnose or run_mode.planned_two_phase(args))
 
     if args.diagnose:
         print(json.dumps(diag, indent=2, sort_keys=True))
@@ -2367,17 +2365,28 @@ def _main(
             import json as _json2
             try:
                 with open(args.inject_results, encoding="utf-8") as f:
-                    config["_inject_results"] = _json2.load(f)
+                    loaded = _json2.load(f)
             except (OSError, UnicodeDecodeError, _json2.JSONDecodeError) as exc:
                 sys.stderr.write(f"[Inject] Cannot read --inject-results file: {exc}\n")
                 raise SystemExit(2)
+            # Fail closed on a non-dict top level. A JSON `null` (or list) would
+            # otherwise store `_inject_results = None`, which reads as
+            # not-injected (is_injected → False) and silently reopens the live
+            # backend — a half-isolated pass. Only a dict is a valid injection.
+            if not isinstance(loaded, dict):
+                sys.stderr.write(
+                    "[Inject] --inject-results must be a JSON object "
+                    f"(got {type(loaded).__name__}); refusing to run a "
+                    "half-isolated pass.\n")
+                raise SystemExit(2)
+            config["_inject_results"] = loaded
 
         # Auto-resolve: use web search to discover subreddits/handles before planning.
         # This is the engine-side equivalent of SKILL.md Steps 0.55/0.75 for platforms
         # without WebSearch (OpenClaw, Codex, raw CLI).
         repos_from_auto_resolve = False
         trustpilot_domain_is_hint = False
-        if args.auto_resolve and not external_plan:
+        if args.auto_resolve and not external_plan and not run_mode.planned_two_phase(args):
             from lib import resolve
             resolution = resolve.auto_resolve(topic, config)
             if resolution.get("subreddits") and not subreddits:
@@ -2591,9 +2600,18 @@ def _main(
                         "planner defaults and produce visibly thinner data than the main.\n"
                     )
                     return 2
-                discovered = competitors_mod.discover_competitors(
-                    topic, comp_count, config, lookback_days=args.lookback_days,
-                )
+                if run_mode.is_two_phase(config):
+                    # Injected/plan-only mode: peer discovery hits a live web
+                    # backend this process isn't credentialed for. Suppress it;
+                    # the run aborts below unless explicit peers were given.
+                    sys.stderr.write(
+                        "[Competitors] injected mode: skipping live peer "
+                        "discovery; pass --competitors-list to compare.\n")
+                    discovered = []
+                else:
+                    discovered = competitors_mod.discover_competitors(
+                        topic, comp_count, config, lookback_days=args.lookback_days,
+                    )
                 if not discovered:
                     sys.stderr.write(
                         f"[Competitors] No peers discovered for {topic!r}; aborting "
@@ -2627,7 +2645,14 @@ def _main(
                 plan_covers_fully = bool(plan_entry.get("x_handle")) and bool(
                     plan_entry.get("subreddits")
                 )
-                if (
+                if run_mode.is_two_phase(entity_config):
+                    # Injected/plan-only mode: peer resolution would hit a live
+                    # web backend the host — not this process — is credentialed
+                    # for. Skip it so the peer sub-run stays injected-only.
+                    sys.stderr.write(
+                        f"[Competitors] injected mode: skipping live peer "
+                        f"resolution for {entity!r}\n")
+                elif (
                     not args.mock
                     and not plan_covers_fully
                     and resolve_mod._has_backend(entity_config)

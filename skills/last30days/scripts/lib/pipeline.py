@@ -52,6 +52,7 @@ from . import (
     reddit_public,
     relevance,
     rerank,
+    run_mode,
     schema,
     signals,
     snippet,
@@ -250,10 +251,14 @@ def available_sources(
         available.append("grounding")
     if requested_sources and "jobs" in requested_sources:
         available.append("jobs")
-    # Perplexity Sonar: opt-in additive source via INCLUDE_SOURCES=perplexity
-    if _has_perplexity_provider(config) and (
-        "perplexity" in include_sources or (requested_sources and "perplexity" in requested_sources)
-    ):
+    # Perplexity Sonar: opt-in additive source via INCLUDE_SOURCES=perplexity.
+    # It's a credentialed web-search/synthesis evidence source (not one of the
+    # injected x/grounding sources), so two-phase mode must not advertise or
+    # fetch it — the host's web_search owns web evidence.
+    if (_has_perplexity_provider(config)
+            and not run_mode.is_two_phase(config)
+            and ("perplexity" in include_sources
+                 or (requested_sources and "perplexity" in requested_sources))):
         available.append("perplexity")
     # LinkedIn: opt-in additive source via INCLUDE_SOURCES=linkedin (same
     # consent pattern as Perplexity). Unlike tiktok/instagram, which are
@@ -1299,6 +1304,14 @@ def run(
     # assign it (eligible_sources = available ∩ capabilities).
     config["_financial_topic"] = stocktwits.is_financial_topic(topic)
 
+    if plan_queries_only:
+        # Seed the plan-only marker BEFORE the mock/non-mock split so
+        # run_mode.is_two_phase(config) is true in both branches. Mock mode
+        # still resolves the X backend (providers.mock_runtime -> _resolve_x_
+        # backend), which must stay network-free — xurl availability is a live
+        # authenticated `xurl whoami`.
+        config = {**config, "_plan_queries_only": True}
+
     if mock:
         runtime = providers.mock_runtime(config, depth)
         reasoning_provider = None
@@ -1310,11 +1323,6 @@ def run(
         if not requested_sources and not hiring_signals_mode and not _company_topic_likely(topic):
             available = [source for source in available if source != "jobs"]
     else:
-        if plan_queries_only:
-            # Plan-only mode never fetches X; keep backend resolution and
-            # availability probing network-free (xurl availability is a live
-            # authenticated `xurl whoami`). Mirror the inject-mode guard.
-            config = {**config, "_plan_queries_only": True}
         runtime, reasoning_provider = providers.resolve_runtime(config, depth)
         available = available_sources(
             config,
@@ -1322,8 +1330,7 @@ def run(
             # Injected-only and plan-only modes must not probe X backends over
             # the network (xurl's availability check is a live authenticated
             # `xurl whoami`).
-            local_only=(config.get("_inject_results") is not None
-                        or config.get("_plan_queries_only") is True),
+            local_only=run_mode.is_two_phase(config),
         )
         if requested_sources:
             available = [source for source in available if source in requested_sources]
@@ -1336,7 +1343,7 @@ def run(
         available = [s for s in available if s != "grounding"]
     elif web_backend in ("brave", "exa", "serper", "parallel", "keyless") and "grounding" not in available:
         available.append("grounding")
-    if plan_queries_only or config.get("_inject_results") is not None:
+    if run_mode.is_two_phase(config):
         # Two-phase hosts (Hermes plugin) fetch X/web themselves via the
         # agent's own tools, so the planner must assign those queries even
         # when this environment has no X/web credentials. The same applies
@@ -1691,7 +1698,7 @@ def run(
                 require_date=(
                     False
                     if source == "grounding"
-                    and config.get("_inject_results") is not None
+                    and run_mode.is_injected(config)
                     else None
                 ),
             )
@@ -2506,7 +2513,7 @@ def _run_supplemental_searches(
     if depth == "quick" or mock:
         return
 
-    if config.get("_inject_results") is not None:
+    if run_mode.is_injected(config):
         # Injected-only mode (Hermes plugin): supplemental X lanes are live
         # credentialed fetches with no injection seam — skip them entirely.
         return
@@ -2939,7 +2946,7 @@ def _injected_results(config: dict[str, Any], kind: str, query: str) -> list[dic
     backends (injected-only policy — the host that injected results owns the
     X/web credentials; this process must not use its own).
     """
-    inj = config.get("_inject_results")
+    inj = run_mode.injected_results(config)
     if not isinstance(inj, dict):
         return None
     bucket = inj.get(kind)
@@ -2974,7 +2981,7 @@ def _retrieve_stream_impl(
     if rate_limited_sources is not None and source in rate_limited_sources:
         return [], {}
     from_date, to_date = date_range
-    if source in ("grounding", "x") and config.get("_inject_results") is not None:
+    if source in ("grounding", "x") and run_mode.is_injected(config):
         kind = "web" if source == "grounding" else "x"
         injected = _injected_results(config, kind, subquery.search_query)
         if injected is None:
@@ -3005,7 +3012,12 @@ def _retrieve_stream_impl(
             date_range,
             config,
             depth=depth,
-            web_backend=web_backend,
+            # jobs isn't part of the injection interception above, and its
+            # careers-discovery + tier-3 fallback call grounding.web_search — a
+            # configured web-search backend. In two-phase mode force that to
+            # "none" (a no-op in grounding) so injected/plan-only runs never
+            # reach it; the public ATS/careers scraping tiers still run.
+            web_backend=("none" if run_mode.is_two_phase(config) else web_backend),
             explicit=bool(config.get("_hiring_signals_mode")),
         )
     if source == "reddit":
@@ -3389,6 +3401,11 @@ def _retrieve_stream_impl(
             depth=depth,
         ), {}
     if source == "perplexity":
+        # Fail closed: a two-phase run must never reach Perplexity's credentialed
+        # web search, even if an external/tampered plan still names it (planning
+        # already drops it from `available`).
+        if run_mode.is_two_phase(config):
+            return [], {}
         return perplexity.search(subquery.search_query, date_range, config, deep=config.get("_deep_research", False))
     raise RuntimeError(f"Unsupported source: {source}")
 

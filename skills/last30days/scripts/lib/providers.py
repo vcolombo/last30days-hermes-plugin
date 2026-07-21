@@ -8,7 +8,7 @@ import re
 import sys
 from typing import Any
 
-from . import env, http, schema
+from . import env, http, run_mode, schema
 
 GEMINI_FLASH_LITE = "gemini-3.1-flash-lite"
 GEMINI_PRO = "gemini-3.1-pro-preview"
@@ -321,10 +321,7 @@ def _resolve_x_backend(config: dict[str, Any]) -> str | None:
     # Injected-only and plan-only modes (Hermes plugin) must resolve from
     # local evidence only — xurl's live leg spawns an authenticated
     # `xurl whoami`.
-    return env.get_x_source(
-        config,
-        local_only=(config.get("_inject_results") is not None
-                    or config.get("_plan_queries_only") is True))
+    return env.get_x_source(config, local_only=run_mode.is_two_phase(config))
 
 
 def _require_gemini_31(model: str, *, role: str) -> None:
