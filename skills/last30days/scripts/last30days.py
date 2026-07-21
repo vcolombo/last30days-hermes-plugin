@@ -437,7 +437,9 @@ def _scoped_store_db(args: argparse.Namespace) -> Path | None:
     return None
 
 
-def persist_report(report: schema.Report, store_db: Path | None = None) -> dict[str, int]:
+def persist_report(report: schema.Report, store_db: Path | None = None,
+                   *, monitor: str | None = None,
+                   delta_out: str | None = None) -> dict[str, int]:
     import store
 
     private_corpus = _report_has_private_corpus(report)
@@ -462,6 +464,17 @@ def persist_report(report: schema.Report, store_db: Path | None = None) -> dict[
                 findings_new=counts["new"],
                 findings_updated=counts["updated"],
             )
+            if delta_out is not None:
+                import json as _json
+                import os as _os
+                since = store.get_watermark(monitor)
+                delta = store.compute_delta_since_run(topic_id, run_id, since)
+                delta.update({"schema": "delta.v1", "run_id": run_id, "monitor": monitor})
+                tmp = f"{delta_out}.tmp"
+                fd = _os.open(tmp, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+                with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(_json.dumps(delta))
+                _os.replace(tmp, delta_out)
             return counts
         except Exception as exc:
             store.update_run(run_id, status="failed", error_message=str(exc)[:500])
@@ -568,6 +581,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--publish-password",
                         help="Optional shared password for --publish-html or 'library feed --publish'; prefer LAST30DAYS_PUBLISH_PASSWORD to avoid exposing secrets in process lists")
     parser.add_argument("--store", action="store_true", help="Persist ranked findings to the SQLite research store")
+    parser.add_argument("--monitor",
+                        help="Monitor key: scopes the delivery watermark and delta for scheduled monitoring")
+    parser.add_argument("--delta-out",
+                        help="With --store: write the run's delta-vs-watermark JSON to this path (requires --monitor)")
+    parser.add_argument("--ack-run", type=int,
+                        help="With the 'monitor-ack' subcommand: run_id to set as the monitor watermark")
     parser.add_argument("--x-handle", help="X handle for targeted supplemental search")
     parser.add_argument("--x-related", help="Comma-separated related X handles (searched with lower weight)")
     parser.add_argument("--web-backend", default="auto",
@@ -2756,8 +2775,12 @@ def _main(
         or config.get("LAST30DAYS_STORE")
         or ""
     ).lower()
+    if args.delta_out and not args.monitor:
+        sys.stderr.write("[Monitor] --delta-out requires --monitor\n")
+        return 2
     if args.store or _store_env in ("1", "true", "yes"):
-        counts = persist_report(report, store_db=_scoped_store_db(args))
+        counts = persist_report(report, store_db=_scoped_store_db(args),
+                                monitor=args.monitor, delta_out=args.delta_out)
         sys.stderr.write(
             f"[last30days] Stored {counts['new']} new, {counts['updated']} updated findings\n"
         )
