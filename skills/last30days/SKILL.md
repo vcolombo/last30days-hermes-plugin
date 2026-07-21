@@ -2129,6 +2129,7 @@ Want another prompt? Just tell me what you're creating next.
 - Optionally sends search queries to Brave Search API, Parallel AI API, Perplexity API (`api.perplexity.ai`), or OpenRouter API for web search / synthesis
 - Fetches public Reddit thread data from `reddit.com` for engagement metrics
 - Stores research findings in local SQLite database (watchlist mode only)
+- For scheduled monitoring, persists a per-monitor delivery watermark to that SQLite store (`since_last`/`monitor`), so a recurring `hermes cron` run reports only findings new since the last delivered run (see HERMES_SETUP.md)
 - Saves research briefings as .md files to `LAST30DAYS_MEMORY_DIR` (defaults to `~/Documents/Last30Days`)
 - Generates a local `index.html`, Atom `feed.xml`, and rendered brief pages from saved research when the user asks for the library feed
 - Publishes the library, feed, and referenced briefs to `ht-ml.app` only after explicit opt-in; hosted pages are public by default unless the user chooses password protection
