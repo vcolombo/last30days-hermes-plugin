@@ -90,11 +90,14 @@ def test_interactive_run_not_in_union(store):
 def test_ack_validation_rejects_foreign_nonexistent_and_nonmonotonic(store):
     tid = store.add_topic("Alpha")["id"]
     r1 = _run(store, tid, ["https://x.com/a"], monitor="m1")
+    r2 = _run(store, tid, ["https://x.com/b"], monitor="m1")
     rx = _run(store, tid, ["https://x.com/z"], monitor="m2")  # different monitor
     assert store.ack_monitor_run("m1", rx)["ok"] is False     # foreign monitor
     assert store.ack_monitor_run("m1", 999999)["ok"] is False  # nonexistent
-    assert store.ack_monitor_run("m1", r1)["ok"] is True       # valid
-    assert store.ack_monitor_run("m1", r1)["ok"] is False      # non-monotonic (<=)
+    assert store.ack_monitor_run("m1", r2)["ok"] is True       # advances to r2
+    assert store.ack_monitor_run("m1", r2)["ok"] is True       # idempotent re-ack
+    assert store.ack_monitor_run("m1", r1)["ok"] is False      # regression (r1 < r2)
+    assert store.get_watermark("m1", tid) == r2                # watermark held
 
 
 def test_missing_previous_when_watermark_run_gone(store):
@@ -126,12 +129,52 @@ def test_lease_different_topic_independent(store):
     assert store.acquire_lease("m1", "Beta", "b") is True   # different topic
 
 
-def test_reset_watermark_rebaselines(store):
+def test_reset_only_clears_when_watermark_still_missing(store):
+    """Straggler-reset race: reset must NOT delete a watermark that has since been
+    re-baselined to a real run. It clears only a still-missing watermark."""
     tid = store.add_topic("Alpha")["id"]
-    r1 = _run(store, tid, ["https://x.com/a"], monitor="m1")
-    store.ack_monitor_run("m1", r1)
-    assert store.get_watermark("m1", tid) == r1
+    # Case A: watermark points at a missing run -> reset clears it.
+    store.set_watermark("m1", tid, 999999)
     store.reset_watermark("m1", tid)
     assert store.get_watermark("m1", tid) is None
-    r2 = _run(store, tid, ["https://x.com/b"], monitor="m1")
-    assert store.compute_monitor_delta("m1", tid, r2)["status"] == "baseline"
+    # Case B: a real run got acked in between -> a late reset is a no-op.
+    r = _run(store, tid, ["https://x.com/a"], monitor="m1")
+    store.ack_monitor_run("m1", r)
+    store.reset_watermark("m1", tid)                 # straggler
+    assert store.get_watermark("m1", tid) == r       # preserved
+
+
+def test_set_watermark_if_unset_anchors_once(store):
+    tid = store.add_topic("Alpha")["id"]
+    assert store.set_watermark_if_unset("m1", tid, 5) is True
+    assert store.get_watermark("m1", tid) == 5
+    assert store.set_watermark_if_unset("m1", tid, 9) is False   # already set
+    assert store.get_watermark("m1", tid) == 5                   # not overwritten
+
+
+def test_lease_held_by_reflects_ownership_and_reclaim(store):
+    assert store.acquire_lease("m1", "Alpha", "a") is True
+    assert store.lease_held_by("m1", "Alpha", "a") is True
+    assert store.lease_held_by("m1", "Alpha", "b") is False      # not the holder
+    # TTL 0 -> a's lease is stale -> b reclaims -> a no longer holds it (fence).
+    assert store.acquire_lease("m1", "Alpha", "b", ttl_seconds=0) is True
+    assert store.lease_held_by("m1", "Alpha", "a") is False
+
+
+def test_run_migrations_idempotent_on_reapply(store):
+    """Concurrent first-migration safety: the losing racer re-runs migrations
+    against a DB whose columns/tables already exist and whose version rows are
+    already recorded. Duplicate-column is caught and the version insert is
+    OR IGNORE, so _run_migrations must be a clean no-op instead of raising."""
+    conn = store._connect()
+    try:
+        # Pretend this process only knows about v1, though the schema is fully
+        # migrated (the state a second starter sees after the first migrated).
+        conn.execute("DELETE FROM schema_version WHERE version > 1")
+        conn.commit()
+        store._run_migrations(conn)          # must not raise
+        conn.commit()
+        v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        assert v == max(store.MIGRATIONS.keys())
+    finally:
+        conn.close()

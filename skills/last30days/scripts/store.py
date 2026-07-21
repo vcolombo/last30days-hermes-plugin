@@ -284,13 +284,19 @@ def _run_migrations(conn: sqlite3.Connection):
                 conn.executescript(MIGRATIONS[version])
             except sqlite3.OperationalError as exc:
                 # Idempotent recovery: a crash after a non-transactional
-                # `ALTER TABLE ADD COLUMN` but before recording the version
-                # leaves the column already present on the next startup. Treat
-                # an already-applied change as success and record the version.
-                if "duplicate column" not in str(exc).lower():
+                # `ALTER TABLE ADD COLUMN` but before recording the version — or
+                # a concurrent starter that already applied this migration —
+                # leaves the change already present on the next startup. Treat an
+                # already-applied change ("duplicate column" / "already exists")
+                # as success and record the version.
+                msg = str(exc).lower()
+                if "duplicate column" not in msg and "already exists" not in msg:
                     raise
+            # OR IGNORE so two processes racing the same first migration can't
+            # collide on the version-row PK — the loser silently no-ops.
             conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?)", (version,)
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                (version,),
             )
 
 
@@ -712,14 +718,65 @@ def set_watermark(monitor: str, topic_id: int, run_id: int) -> None:
     set_setting(_watermark_key(monitor, topic_id), str(int(run_id)))
 
 
-def reset_watermark(monitor: str, topic_id: int) -> None:
-    """Clear a (monitor, topic) watermark so the next run re-baselines. Recovery
-    path for a `missing_previous` monitor whose watermark run was pruned."""
+def set_watermark_if_unset(monitor: str, topic_id: int, run_id: int) -> bool:
+    """Anchor a (monitor, topic) watermark to run_id iff it is currently unset,
+    in one BEGIN IMMEDIATE transaction. Returns True if it anchored.
+
+    Used to durably self-anchor a *baseline* run while its lease is held, so a
+    second run of the same monitor+topic (which blocks on the lease) can't also
+    read a null watermark and re-classify as baseline — which would suppress and
+    then permanently skip its own findings.
+    """
+    key = _watermark_key(monitor, topic_id)
     conn = _connect()
     try:
-        conn.execute("DELETE FROM settings WHERE key = ?",
-                     (_watermark_key(monitor, topic_id),))
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        if existing is not None:
+            conn.commit()
+            return False
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_at) "
+            "VALUES (?, ?, datetime('now'))",
+            (key, str(int(run_id))))
         conn.commit()
+        return True
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reset_watermark(monitor: str, topic_id: int) -> None:
+    """Clear a (monitor, topic) watermark so the next run re-baselines. Recovery
+    path for a `missing_previous` monitor whose watermark run was pruned.
+
+    A conditional delete in one BEGIN IMMEDIATE transaction: it clears the
+    watermark ONLY if it still points at a pruned (missing) run. If a later run
+    already re-baselined and acked a real watermark in between, a straggler reset
+    must not blow that valid watermark away (which would re-baseline and suppress
+    fresh findings).
+    """
+    key = _watermark_key(monitor, topic_id)
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        raw = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        wm = None
+        if raw is not None and str(raw["value"]).isdigit():
+            wm = int(raw["value"])
+        if wm is not None:
+            still_missing = conn.execute(
+                "SELECT 1 FROM research_runs WHERE id = ?", (wm,)).fetchone() is None
+            if still_missing:
+                conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -759,7 +816,10 @@ def ack_monitor_run(monitor: str, run_id: int) -> Dict[str, Any]:
     derives the run's own topic), and (b) compare-and-swaps the watermark only
     if run_id is strictly greater than the current one. Concurrent acks
     serialize on the write lock, so a late lower ack can never regress the
-    watermark. Returns {"ok": bool, "reason"?: str, "run_id"?, "topic_id"?}.
+    watermark. Re-acking the run that is ALREADY the watermark is an idempotent
+    success (retry-safe, and lets the recipe ack a self-anchored baseline);
+    acking a strictly lower run is refused as a regression. Returns
+    {"ok": bool, "reason"?: str, "run_id"?, "topic_id"?}.
     """
     conn = _connect()
     try:
@@ -776,10 +836,14 @@ def ack_monitor_run(monitor: str, run_id: int) -> Dict[str, Any]:
         cur = conn.execute(
             "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         current = int(cur["value"]) if cur and str(cur["value"]).isdigit() else None
-        if current is not None and run_id <= current:
+        if current is not None and run_id == current:
+            conn.rollback()
+            return {"ok": True, "run_id": run_id, "topic_id": topic_id,
+                    "reason": "already at watermark"}
+        if current is not None and run_id < current:
             conn.rollback()
             return {"ok": False,
-                    "reason": f"non-monotonic ack: {run_id} <= watermark {current}"}
+                    "reason": f"non-monotonic ack: {run_id} < watermark {current}"}
         conn.execute(
             """INSERT INTO settings (key, value, updated_at)
                VALUES (?, ?, datetime('now'))
@@ -842,6 +906,28 @@ def release_lease(monitor: str, topic: str, owner: str) -> None:
             "DELETE FROM monitor_leases WHERE monitor = ? AND topic = ? AND owner = ?",
             (monitor, topic, owner))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def lease_held_by(monitor: str, topic: str, owner: str,
+                  ttl_seconds: float = LEASE_TTL_SECONDS) -> bool:
+    """True iff owner still holds a fresh (monitor, topic) lease.
+
+    A fence for the pathological case where a run stalls past the TTL and a
+    different owner reclaims the lease. Before a run marks itself completed and
+    publishes a delta, it re-checks ownership: a reclaimed owner must not keep
+    publishing (its run id would land below the reclaimer's acked watermark and
+    be lost from the union forever).
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT owner, (julianday('now') - julianday(acquired_at)) * 86400.0 AS age "
+            "FROM monitor_leases WHERE monitor = ? AND topic = ?",
+            (monitor, topic)).fetchone()
+        return bool(row is not None and row["owner"] == owner
+                    and row["age"] is not None and row["age"] < ttl_seconds)
     finally:
         conn.close()
 

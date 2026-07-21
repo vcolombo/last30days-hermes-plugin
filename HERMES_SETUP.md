@@ -139,12 +139,13 @@ run is reported and **not** acked. If a monitor's watermark run was pruned
 (the already-pruned findings are gone).
 
 Create the job — note `--deliver` is **omitted** so the agent owns delivery and
-the watermark ack atomically (no double-send):
+then the watermark ack (send first, ack only on success — at-least-once, per the
+guarantee above):
 
 ```bash
 hermes cron create "0 9 * * 1" \
   "Call last30days_research once (since_last=true, monitor=\"ai-agents\"). \
-   If it failed, delta.degraded is true, or delta.status is 'busy', report the issue briefly and do NOT ack. \
+   If it failed, delta.degraded is true, or delta.status is 'busy' or 'stale', report the issue briefly and do NOT ack. \
    If delta.status is 'missing_previous', call last30days_monitor_reset(monitor, delta.run_id) and return exactly [SILENT]. \
    If delta.status is 'baseline' (first run) or delta.counts.new == 0, call last30days_mark_reported(monitor, delta.run_id) and return exactly [SILENT]. \
    Otherwise summarize delta.new_findings with their URLs, hermes send it to telegram:<chat_id>; \

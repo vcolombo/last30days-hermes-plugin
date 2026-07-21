@@ -500,6 +500,23 @@ def persist_report(report: schema.Report, store_db: Path | None = None,
                 if private_corpus:
                     store.ensure_private_db_files()
                 counts = store.store_findings(run_id, topic_id, findings)
+                # Fence: if this run stalled past the lease TTL and a different
+                # owner reclaimed the lease, do NOT publish. Completing here would
+                # land this run below the reclaimer's acked watermark and drop it
+                # from every future delta. Mark it failed (invisible to the union)
+                # and report `stale` so the agent does not ack.
+                if lease_owner and not store.lease_held_by(
+                        monitor, report.topic, lease_owner):
+                    store.update_run(run_id, status="failed",
+                                     error_message="lease reclaimed mid-run")
+                    if delta_out is not None:
+                        _write_delta_atomic(delta_out, {
+                            "schema": "delta.v1", "status": "stale",
+                            "monitor": monitor, "run_id": run_id,
+                            "engine_degraded": False,
+                            "counts": {"new": 0, "continued": 0, "dropped": 0},
+                            "new_findings": []})
+                    return counts
                 store.update_run(
                     run_id,
                     status="completed",
@@ -508,6 +525,14 @@ def persist_report(report: schema.Report, store_db: Path | None = None,
                 )
                 if delta_out is not None:
                     delta = store.compute_monitor_delta(monitor, topic_id, run_id)
+                    # A baseline run durably anchors its own watermark while the
+                    # lease is held. The next run of this monitor+topic blocks on
+                    # the lease, so by the time it computes its delta it sees this
+                    # baseline as the watermark instead of also reading null and
+                    # re-classifying as baseline (which would suppress, then never
+                    # deliver, its own findings).
+                    if delta.get("status") == "baseline":
+                        store.set_watermark_if_unset(monitor, topic_id, run_id)
                     # engine_degraded: any attempted source that was not clean
                     # (ok / no-results). The plugin's coverage only sees x/web,
                     # so this surfaces engine-side failures (reddit/yt/...) too.
@@ -2852,6 +2877,14 @@ def _main(
     ).lower()
     if args.delta_out and not args.monitor:
         sys.stderr.write("[Monitor] --delta-out requires --monitor\n")
+        return 2
+    # ...and the reverse: a monitor research run MUST write a delta. Without
+    # --delta-out persist_report takes no lease, so a monitor-tagged run could
+    # interleave with a leased one, get a lower id, complete after that run is
+    # acked, and be excluded from every future delta (id <= watermark) forever.
+    # Pairing them keeps every monitor run leased and id-ordered.
+    if args.monitor and not args.delta_out:
+        sys.stderr.write("[Monitor] --monitor requires --delta-out\n")
         return 2
     # --delta-out implies persistence: the delta needs the run stored, so never
     # run research and silently write no delta file.
