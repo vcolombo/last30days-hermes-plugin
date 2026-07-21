@@ -2082,6 +2082,16 @@ def _main(
             probe="--probe" in extra_argv,
         )
 
+    if topic.lower() == "monitor-ack":
+        import store
+        if not args.monitor or args.ack_run is None:
+            sys.stderr.write("[Monitor] monitor-ack requires --monitor and --ack-run\n")
+            return 2
+        with store.scoped_db(None):
+            store.init_db()
+            store.set_watermark(args.monitor, args.ack_run)
+        print("acked")
+        return 0
     if topic.lower() == "library feed":
         return _run_library_feed(args, config)
     if topic.lower() == "library search" or topic.lower().startswith("library search "):

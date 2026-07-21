@@ -37,3 +37,28 @@ def test_first_run_writes_baseline_delta(tmp_path):
     assert delta["status"] == "baseline"
     assert isinstance(delta["run_id"], int)
     assert (out.stat().st_mode & 0o777) == 0o600
+
+
+def test_monitor_ack_sets_watermark(tmp_path):
+    out1 = tmp_path / "d1.json"
+    r1 = _run(["alpha", "--mock", "--store", "--monitor", "m1",
+               "--delta-out", str(out1), "--emit", "compact"], tmp_path)
+    assert r1.returncode == 0, r1.stderr
+    run_id = json.loads(out1.read_text())["run_id"]
+
+    ack = _run(["monitor-ack", "--monitor", "m1", "--ack-run", str(run_id)], tmp_path)
+    assert ack.returncode == 0, ack.stderr
+    assert "acked" in ack.stdout
+
+    out2 = tmp_path / "d2.json"
+    r2 = _run(["alpha", "--mock", "--store", "--monitor", "m1",
+               "--delta-out", str(out2), "--emit", "compact"], tmp_path)
+    assert r2.returncode == 0, r2.stderr
+    delta2 = json.loads(out2.read_text())
+    assert delta2["status"] == "ok"                # not baseline anymore
+    assert delta2["previous_run_id"] == run_id
+
+
+def test_monitor_ack_requires_args(tmp_path):
+    proc = _run(["monitor-ack", "--monitor", "m1"], tmp_path)
+    assert proc.returncode == 2
