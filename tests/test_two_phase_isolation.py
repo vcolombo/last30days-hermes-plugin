@@ -62,6 +62,35 @@ def _run(args, tmp_path):
         capture_output=True, text=True, timeout=180, cwd=tmp_path)
 
 
+class TestPerplexityIsolation:
+    """Perplexity is a credentialed web-search/synthesis evidence source (not
+    an injected x/grounding source). Two-phase runs must neither advertise nor
+    fetch it — the host's web_search owns web evidence."""
+
+    _KEY = {"PERPLEXITY_API_KEY": "k", "INCLUDE_SOURCES": "perplexity"}
+
+    def test_excluded_from_available_in_two_phase(self):
+        assert "perplexity" in pipeline.available_sources(dict(self._KEY))
+        assert "perplexity" not in pipeline.available_sources(
+            {**self._KEY, "_inject_results": {}})
+        assert "perplexity" not in pipeline.available_sources(
+            {**self._KEY, "_plan_queries_only": True})
+
+    def test_dispatch_fails_closed_and_never_calls_search(self):
+        sq = schema.SubQuery(label="t", search_query="q", ranking_query="q",
+                             sources=["perplexity"])
+        rt = schema.ProviderRuntime(reasoning_provider="mock",
+                                    planner_model="mock", rerank_model="mock")
+        with mock.patch("lib.perplexity.search") as psearch:
+            items, _ = pipeline._retrieve_stream(
+                topic="q", subquery=sq, source="perplexity",
+                config={"_inject_results": {"x": {}, "web": {}}},
+                depth="quick", date_range=("2026-06-01", "2026-06-30"),
+                runtime=rt, mock=False)
+        psearch.assert_not_called()
+        assert items == []
+
+
 class TestCompetitorInjectedIsolation:
     def test_vs_topic_in_injected_mode_skips_live_peer_resolution(self, tmp_path):
         """A normal comparison topic ("A vs B") auto-enters vs-mode with no

@@ -64,11 +64,11 @@ The honest empty outcome of a Discovery run in which zero topics cleared the Con
 
 ## Execution modes
 
-The two-phase inject path (the Hermes plugin) runs the Engine in an isolated mode where X and web evidence is pre-fetched by the host and handed in, so the Engine must never reach a live credentialed backend. The predicates that answer "which mode am I in?" live in one place — `lib/run_mode.py` — rather than being re-derived at each call site.
+The two-phase inject path (the Hermes plugin) runs the Engine in an isolated mode where X and web evidence is pre-fetched by the host and handed in, so the Engine must never reach a live X/web **evidence** backend it isn't credentialed for — the configured web-search backends (grounding: Brave/Exa/Serper/Parallel, and Perplexity), bird/xurl/xAI for X, and the live peer resolution / competitor discovery that ride them. Scope note: this is evidence isolation, not "make no network calls" — the Engine's own reasoning-LLM provider is always used, and other configured platform sources (ScrapeCreators social, GitHub, Bluesky, …) fetch normally with their own credentials. The predicates that answer "which mode am I in?" live in one place — `lib/run_mode.py` — rather than being re-derived at each call site.
 
 ### Two-phase mode
 
-The umbrella: the Engine is running as the back half of a host that supplies its own X/web results, so it must not touch a live credentialed backend — no live X-backend probe, no hosted-backend routing, no browser-cookie reads. Equivalent to *Injected mode* OR *Plan-only mode*; it is always derived from those two, never stored as its own flag. `run_mode.is_two_phase(config)`, with a pre-config twin `planned_two_phase(args)` for the gates that run before the config is built.
+The umbrella: the Engine is running as the back half of a host that supplies its own X/web results, so it must not reach a live X/web evidence backend — no live X-backend probe, no hosted-backend routing, no browser-cookie reads, no `grounding`/Perplexity web search (including the `jobs` careers/tier-3 fallback), and no live peer resolution / competitor discovery. Equivalent to *Injected mode* OR *Plan-only mode*; it is always derived from those two, never stored as its own flag. `run_mode.is_two_phase(config)`, with a pre-config twin `planned_two_phase(args)` for the gates that run before the config is built.
 
 ### Injected mode
 

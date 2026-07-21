@@ -251,10 +251,14 @@ def available_sources(
         available.append("grounding")
     if requested_sources and "jobs" in requested_sources:
         available.append("jobs")
-    # Perplexity Sonar: opt-in additive source via INCLUDE_SOURCES=perplexity
-    if _has_perplexity_provider(config) and (
-        "perplexity" in include_sources or (requested_sources and "perplexity" in requested_sources)
-    ):
+    # Perplexity Sonar: opt-in additive source via INCLUDE_SOURCES=perplexity.
+    # It's a credentialed web-search/synthesis evidence source (not one of the
+    # injected x/grounding sources), so two-phase mode must not advertise or
+    # fetch it — the host's web_search owns web evidence.
+    if (_has_perplexity_provider(config)
+            and not run_mode.is_two_phase(config)
+            and ("perplexity" in include_sources
+                 or (requested_sources and "perplexity" in requested_sources))):
         available.append("perplexity")
     # LinkedIn: opt-in additive source via INCLUDE_SOURCES=linkedin (same
     # consent pattern as Perplexity). Unlike tiktok/instagram, which are
@@ -3397,6 +3401,11 @@ def _retrieve_stream_impl(
             depth=depth,
         ), {}
     if source == "perplexity":
+        # Fail closed: a two-phase run must never reach Perplexity's credentialed
+        # web search, even if an external/tampered plan still names it (planning
+        # already drops it from `available`).
+        if run_mode.is_two_phase(config):
+            return [], {}
         return perplexity.search(subquery.search_query, date_range, config, deep=config.get("_deep_research", False))
     raise RuntimeError(f"Unsupported source: {source}")
 
