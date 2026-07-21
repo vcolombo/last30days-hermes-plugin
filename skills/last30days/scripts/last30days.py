@@ -2905,11 +2905,11 @@ def _main(
     if args.delta_out and not args.monitor:
         sys.stderr.write("[Monitor] --delta-out requires --monitor\n")
         return 2
-    # ...and the reverse: a monitor research run MUST write a delta. Without
-    # --delta-out persist_report takes no lease, so a monitor-tagged run could
-    # interleave with a leased one, get a lower id, complete after that run is
-    # acked, and be excluded from every future delta (id <= watermark) forever.
-    # Pairing them keeps every monitor run leased and id-ordered.
+    # ...and the reverse: a monitor research run MUST write a delta. persist_report
+    # leases every monitor run (see its `if monitor:` block), so this is not about
+    # lease safety — it is that a monitor run with no delta emits no run_id for the
+    # agent to ack, so its watermark could never advance and the run would be
+    # pointless. Pairing them keeps every monitor run ackable.
     if args.monitor and not args.delta_out:
         sys.stderr.write("[Monitor] --monitor requires --delta-out\n")
         return 2

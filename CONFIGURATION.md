@@ -437,7 +437,7 @@ Add `--debug` to any run to emit verbose `[DEBUG]` log lines to stderr from the 
 
 ## Trend monitoring (`--store` + watchlist + briefings)
 
-The default behavior - one slug-named file per topic, overwritten on rerun - is the snapshot mode. For continuous monitoring, the repo ships three components most users miss:
+The default behavior - one slug-named file per topic, overwritten on rerun - is the snapshot mode. For continuous monitoring, the repo ships several components most users miss:
 
 ### `--store` flag
 
@@ -473,6 +473,22 @@ The schedule field stored on each topic is metadata - the actual cron / Task Sch
 ### `briefing.py` - daily / weekly digests
 
 [`scripts/briefing.py`](skills/last30days/scripts/briefing.py) reads the SQLite store and emits structured data the agent then synthesizes into prose. Modes: `generate` (daily), `generate --weekly`, `show [--date DATE]` (display a saved briefing). Briefs save to `~/.local/share/last30days/briefs/`.
+
+### Agent-native scheduled monitoring (`--monitor` / `--delta-out`)
+
+A newer path where the **agent** (e.g. a Hermes cron turn) owns delivery, instead of `watchlist.py`'s built-in webhook push. A monitor run persists to the store and emits a **delta** of what's new since that monitor's last *delivered* run; the agent delivers it, then advances a delivery watermark only on confirmed send.
+
+Engine flags / subcommands:
+
+- `--monitor <key>` + `--delta-out <path>` — persist the run and write its delta-vs-watermark JSON (schema `delta.v1`) to `<path>`. Required together: a monitor run must emit a delta to be ackable.
+- `monitor-ack --monitor <key> --ack-run <id>` — advance the `(monitor, topic)` watermark to a delivered run (validated, monotonic, idempotent at equality).
+- `monitor-reset --monitor <key> --ack-run <id>` — clear a watermark pointing at a pruned run (`missing_previous` recovery); a CAS no-op if the watermark is still valid.
+
+Plugin (Hermes) parameters on `last30days_research`:
+
+- `since_last: true` + `monitor: "<key>"` — monitoring mode; the tool envelope gains a `delta` block (`status`, `run_id`, `counts`, `new_findings`). Companion tools: `last30days_mark_reported`, `last30days_monitor_reset`.
+
+The watermark is a per-`(monitor, topic)` row in the same store DB (`~/.local/share/last30days/research.db`); do **not** set `--save-dir` for monitors — it moves the DB and resets the watermark. Full cron recipe, delivery guarantee, and delivery-verification gate: [HERMES_SETUP.md](HERMES_SETUP.md#recurring-monitoring-hermes-cron).
 
 ### Recommended cadence pattern
 
